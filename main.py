@@ -196,16 +196,29 @@ GROUND_Y = int(SCREEN_HEIGHT * 0.72) + 200   # feet baseline
 class Fighter:
     """A procedurally-drawn warrior with basic fighting behaviour."""
 
-    def __init__(self, name, color, accent, x, facing, controls=None):
+    def __init__(self, name, color, accent, x, facing, controls=None,
+                 data=None):
         self.name = name
         self.color = color            # body/tunic colour
         self.accent = accent          # armour/skin tint
         self.controls = controls      # dict of key->action, None => AI
-        self.reset(x, facing)
+        self.data = data              # full CHARACTERS db entry (optional)
 
-        # Stats
-        self.max_health = 100
-        self.health = 100
+        # Stats — taken from the character database when available,
+        # otherwise sensible defaults keep the game playable.
+        d = data or {}
+        self.max_health = int(d.get("health", 100))
+        self.speed = int(d.get("speed", 5))
+        self.punch_damage = int(d.get("punch_damage", 8))
+        self.kick_damage = int(d.get("kick_damage", 14))
+        self.special_damage = int(d.get("special_damage", 25))
+        self.special_name = d.get("special_name", "DIVINE STRIKE")
+        self.special_color = d.get("special_color", GOLD)
+        self.weapon = d.get("weapon", "")
+        self.health = self.max_health
+        self.special_meter = 0.0      # 0..100, fills by dealing damage
+        self.projectiles = []         # this fighter's active special blasts
+        self.reset(x, facing)
 
     # ---------- state helpers ----------
     def reset(self, x, facing):
@@ -214,10 +227,12 @@ class Fighter:
         self.vy = 0.0
         self.facing = facing          # +1 looks right, -1 looks left
         self.vx = 0.0
-        self.state = "idle"           # idle/walk/jump/punch/kick/block/hurt
+        self.state = "idle"           # idle/walk/jump/punch/kick/block/hurt/special
         self.state_timer = 0
         self.attack_hit = False
         self.ai_decision_timer = 0
+        self.special_meter = 0.0      # 0..100, fills by dealing damage
+        self.projectiles = []         # this fighter's active special blasts
 
     @property
     def rect(self):
@@ -232,8 +247,29 @@ class Fighter:
             self.state_timer = 18 if kind == "punch" else 26
             self.attack_hit = False
 
+    def start_special(self):
+        """Unleash the character's signature astral weapon (needs full meter)."""
+        if self.special_meter >= 100 and self.state in ("idle", "walk"):
+            self.special_meter = 0.0
+            self.state = "special"
+            self.state_timer = 34
+            foot_y = GROUND_Y - self.y
+            self.projectiles.append({
+                "x": self.x + self.facing * 45,
+                "y": foot_y - 110,
+                "vx": self.facing * 13,
+                "owner": self,
+                "hit": False,
+            })
+            return True
+        return False
+
     def current_damage(self):
-        return 8 if self.state == "punch" else 14
+        if self.state == "punch":
+            return self.punch_damage
+        if self.state == "kick":
+            return self.kick_damage
+        return self.special_damage
 
     def attack_range(self):
         return 70 if self.state == "punch" else 95
@@ -274,7 +310,7 @@ class Fighter:
         if self.state_timer > 0:
             self.state_timer -= 1
             if self.state_timer == 0 and self.state in (
-                    "punch", "kick", "hurt", "block"):
+                    "punch", "kick", "hurt", "block", "special"):
                 self.state = "idle"
 
         # AI control for player-less fighters
@@ -283,7 +319,7 @@ class Fighter:
 
     def update_ai(self, opponent):
         """Very simple aggressive AI so a solo player can fight someone."""
-        if self.state in ("punch", "kick", "hurt"):
+        if self.state in ("punch", "kick", "hurt", "special"):
             return
         self.ai_decision_timer -= 1
         if self.ai_decision_timer > 0:
@@ -292,12 +328,14 @@ class Fighter:
 
         dist = abs(self.x - opponent.x)
         roll = random.random()
-        if dist > 110:
-            # walk toward opponent
-            self.x += self.facing * 4
+        if self.special_meter >= 100 and roll < 0.55:
+            self.start_special()                      # unleash the astral!
+        elif dist > 110:
+            # walk toward opponent at this warrior's own speed
+            self.x += self.facing * max(2, self.speed)
             self.state = "walk"
         elif dist < 60 and roll < 0.25:
-            self.x -= self.facing * 4          # back off sometimes
+            self.x -= self.facing * max(2, self.speed)   # back off sometimes
         elif opponent.state in ("punch", "kick") and roll < 0.45:
             self.state = "block"               # try to guard
             self.state_timer = 15
@@ -314,13 +352,16 @@ class Fighter:
         foot_y = GROUND_Y - self.y
         f = self.facing
         cx = int(self.x)
+        data = self.data or {}
+        accent = tuple(data.get("secondary_color",
+                                tuple(min(255, c + 60) for c in self.color)))
 
         # shadow
         sh = pygame.Surface((90, 16), pygame.SRCALPHA)
         pygame.draw.ellipse(sh, (0, 0, 0, 90), (0, 0, 90, 16))
         target.blit(sh, (cx - 45, GROUND_Y - 8))
 
-        skin = tuple(min(255, c + 60) for c in self.accent)
+        skin = accent
         leg_w, arm_w = 6, 5
 
         # legs (slight walk sway)
@@ -345,10 +386,51 @@ class Fighter:
                                            (cx, foot_y - 168),
                                            (cx + 12, foot_y - 148)])
 
+        # signature weapon silhouette (drawn from the database 'weapon')
+        wpn = str(data.get("weapon", ""))
+        if "Bow" in wpn:                       # celestial bow held at the ready
+            pts = [(cx + f * 26, foot_y - 150), (cx + f * 40, foot_y - 115),
+                   (cx + f * 26, foot_y - 80)]
+            pygame.draw.lines(target, accent, False, pts, 3)
+            pygame.draw.line(target, GREY, pts[0], pts[2], 1)
+        elif "Gada" in wpn or "Mace" in wpn:   # giant mace over the shoulder
+            pygame.draw.line(target, (120, 80, 40), (cx + f * 20, foot_y - 95),
+                             (cx + f * 42, foot_y - 150), 5)
+            pygame.draw.circle(target, accent, (cx + f * 46, foot_y - 155), 11)
+        elif "Spear" in wpn:                   # shaft + leaf-shaped head
+            pygame.draw.line(target, (120, 80, 40), (cx + f * 18, foot_y - 70),
+                             (cx + f * 46, foot_y - 165), 4)
+            pygame.draw.polygon(target, accent,
+                                [(cx + f * 42, foot_y - 158),
+                                 (cx + f * 52, foot_y - 178),
+                                 (cx + f * 50, foot_y - 156)])
+        elif "Sword" in wpn:                   # blade raised
+            pygame.draw.line(target, (200, 200, 215),
+                             (cx + f * 22, foot_y - 105),
+                             (cx + f * 44, foot_y - 155), 4)
+            pygame.draw.line(target, GOLD, (cx + f * 18, foot_y - 100),
+                             (cx + f * 28, foot_y - 108), 4)
+        elif "Dice" in wpn:                    # enchanted dice floating at palm
+            dcx, dcy = cx + f * 34, foot_y - 118
+            pygame.draw.rect(target, accent, (dcx - 8, dcy - 8, 16, 16),
+                             border_radius=3)
+            for px, py in ((-4, -4), (0, 0), (4, 4)):
+                pygame.draw.circle(target, BLACK, (dcx + px, dcy + py), 2)
+
         # arms — pose depends on state
         shoulder_l = (cx - 15, foot_y - 118)
         shoulder_r = (cx + 15, foot_y - 118)
-        if self.state == "punch":
+        if self.state == "special":
+            # both arms thrust forward, channeling the astral weapon
+            glow = int(20 + 12 * math.sin(self.state_timer * 0.5))
+            end = (cx + f * 55, foot_y - 112)
+            pygame.draw.line(target, skin, shoulder_l, end, arm_w)
+            pygame.draw.line(target, skin, shoulder_r, end, arm_w)
+            aura = pygame.Surface((glow * 2, glow * 2), pygame.SRCALPHA)
+            pygame.draw.circle(aura, (*self.special_color, 160),
+                               (glow, glow), glow)
+            target.blit(aura, (end[0] - glow, end[1] - glow))
+        elif self.state == "punch":
             ext = int(self.state_timer / 18 * 45)
             end = (cx + f * (30 + 45 - ext), foot_y - 112)
             pygame.draw.line(target, skin, (cx, foot_y - 118), end, arm_w)
@@ -392,34 +474,330 @@ class Fighter:
 
 
 # =====================================================================
-# SECTION 5: ROSTER OF WARRIORS (data only — colours + stats flavour)
+# SECTION 5: CHARACTER DATABASE — the 10 legendary warriors of the epic
 # =====================================================================
+# Every entry is a self-contained data record used by character select,
+# the fight scene (stats/damage/specials) and the dialogue banners.
+#   health / speed           -> base combat stats (speed = px per frame)
+#   punch/kick/special_damage -> damage values per attack type
+#   intro_dialogue           -> list of 2 dramatic Hindi-English lines
+#   special_color            -> colour of the astral projectile FX
 
-ROSTER = [
-    {"name": "ARJUNA",    "color": (30, 60, 160),  "accent": (90, 120, 200),
-     "epithet": "The Peerless Archer"},
-    {"name": "BHIMA",     "color": (140, 30, 30),  "accent": (190, 90, 60),
-     "epithet": "Wind Son, Mighty Arms"},
-    {"name": "KRISHNA",   "color": (40, 90, 200),  "accent": (100, 150, 230),
-     "epithet": "Charioteer of Destiny"},
-    {"name": "KARNA",     "color": (170, 120, 20), "accent": (220, 180, 80),
-     "epithet": "Sun-Born Warrior"},
-    {"name": "DURYODHANA","color": (60, 120, 40),  "accent": (110, 170, 90),
-     "epithet": "Crown Prince, Gada King"},
-    {"name": "BHISHMA",   "color": (110, 110, 130),"accent": (170, 170, 190),
-     "epithet": "Grandfather, Oathbound"},
-]
+CHARACTERS = {
+
+    # ---- 1. ARJUNA : the peerless archer, Krishna's chosen instrument
+    "ARJUNA": {
+        "name": "ARJUNA",
+        "color": (25, 60, 160),                 # royal blue
+        "secondary_color": (120, 160, 235),     # sky-blue highlights
+        "health": 100,
+        "speed": 6,
+        "punch_damage": 8,
+        "kick_damage": 13,
+        "special_damage": 22,                   # PWR 22
+        "special_name": "BRAHMASTRA",
+        "special_color": (255, 230, 120),       # blinding divine white-gold
+        "intro_dialogue": [
+            "Gandiva ko jhuka kar main ek hi lakshya dekhta hoon — sirf tera!",
+            "Madhava ne kaha — 'Dharma yuddh hai'; ab baanh bolegi, vaada nahi!"
+        ],
+        "win_dialogue": "Jeet meri nahi, Keshav ki saarthi mein hai — rathi safal hua.",
+        "lose_dialogue": "Haar gaya… par Krishna ka rath kabhi haar nahi maanta.",
+        "special_dialogue": "BRAHMASTRA! Ek baanh, ek divya aag — Agni bhi shant ho jaaye!",
+        "taunt": "Paanch senaon ko akela jhel chuka hoon — tu kaun? Ek baanh, khatam!",
+        "description": "Pandava prince and invincible archer, student of Drona, "
+                       "friend of Krishna. With the celestial bow Gandiva he never "
+                       "missed — his focus can split a falling leaf's eye.",
+        "weapon": "Gandiva Bow",
+        "epithet": "The Peerless Archer",
+    },
+
+    # ---- 2. KARNA : sun-born, generous, tragic, proud
+    "KARNA": {
+        "name": "KARNA",
+        "color": (214, 160, 30),                # golden yellow
+        "secondary_color": (255, 220, 130),     # radiant gold
+        "health": 105,
+        "speed": 5,
+        "punch_damage": 9,
+        "kick_damage": 14,
+        "special_damage": 25,                   # PWR 25
+        "special_name": "SHAKTI ASTRA",
+        "special_color": (255, 140, 40),        # Indra's thunderbolt orange
+        "intro_dialogue": [
+            "Kavach-Kundal se saja hoon — Surya ka putr hoon, suraj se darta nahi!",
+            "Daanveer kehlaya, dosti nibhaai — aaj Vijaya ek hi cheez maangegi: tera ghamand!"
+        ],
+        "win_dialogue": "Vijaya ne sach bola — vidhataan aaj mere paksha jhuk gayi!",
+        "lose_dialogue": "Shraap toh lagta hi hai mere naam par… phir bhi ladta rahunga.",
+        "special_dialogue": "SHAKTI ASTRA! Rudra ka garaj le kar aaya hoon — dekh, aakash jhuk jaata hai!",
+        "taunt": "Daan mein sab kuch deta hoon — aaj tujhe daan mein teri haar milenge!",
+        "description": "Radheya — sun-born warrior, king of Anga, sworn friend of "
+                       "Duryodhana. Born with divine armour and earrings, cursed yet "
+                       "unbroken; his pride, generosity and loyalty are legend.",
+        "weapon": "Vijaya Bow + Kavach-Kundal",
+        "epithet": "Sun-Born, Daanveer",
+    },
+
+    # ---- 3. BHIMA : the wind son, mace of rage
+    "BHIMA": {
+        "name": "BHIMA",
+        "color": (140, 25, 25),                 # dark red
+        "secondary_color": (210, 90, 60),       # burnt copper
+        "health": 140,
+        "speed": 3,
+        "punch_damage": 12,
+        "kick_damage": 18,
+        "special_damage": 30,                   # PWR 30
+        "special_name": "MAHAGADA PRHAR",
+        "special_color": (200, 60, 30),         # earthquake crimson
+        "intro_dialogue": [
+            "Vayu ke putr hoon! Bhookh lagi hai Kurukshetra ki — aur woh bhookh tu hai!",
+            "Duryodhana yaad rakh — kali gaddi ka hisaab aaj gada se hoga!"
+        ],
+        "win_dialogue": "Gada chali, dharti kaanpi — adharma ka hisaab barabar!",
+        "lose_dialogue": "Yeh gada thak gayi… par Bhima ka gussa kabhi nahi thakta.",
+        "special_dialogue": "MAHAGADA PRHAR! Aasman-zameen ek ho jaayega — uth, aur dekh Dhartiraj kaanpte hue!",
+        "taunt": "Aaj tere paas do raaste hain — bhaag, ya mera naashta ban ja!",
+        "description": "Mightiest of the Pandavas, son of the Wind God Vayu. Wielder "
+                       "of the giant gada, slayer of Keechaka and Dushasana — his rage "
+                       "is an element of nature itself.",
+        "weapon": "Gada (Mace)",
+        "epithet": "Wind Son, Mighty Arms",
+    },
+
+    # ---- 4. DURYODHANA : proud emperor, unmatched mace-king
+    "DURYODHANA": {
+        "name": "DURYODHANA",
+        "color": (75, 35, 120),                 # dark purple
+        "secondary_color": (150, 100, 200),     # violet sheen
+        "health": 130,
+        "speed": 4,
+        "punch_damage": 11,
+        "kick_damage": 16,
+        "special_damage": 28,                   # PWR 28
+        "special_name": "MAYAVI GADA",
+        "special_color": (170, 90, 220),        # illusion purple
+        "intro_dialogue": [
+            "Yeh swarg ka rajya nahi — Hastinapur ka simhasan hai, aur woh MERA hai!",
+            "Pandavon ne paasaa khela, humne rajya haara — aaj gada se wapsi hogi!"
+        ],
+        "win_dialogue": "Dekha? Jis gada ne Bharat jeeta, woh tukde-tukde karti hai rakht ko!",
+        "lose_dialogue": "Ranbhoomi mein gira raja… par Hastinapur ka ahankaar kabhi nahi marta.",
+        "special_dialogue": "MAYAVI GADA! Mayavi vaar — kahan se aayi gada? Jahan dekhega, wahin tootega!",
+        "taunt": "Ekla chala re? Aaj ekla CHALU main hoon — aur tu hawa mein ud jaayega!",
+        "description": "Kaurava emperor, invincible mace-fighter, shielded by "
+                       "Shakuni's cunning and feared even by Bhishma. His pride lost "
+                       "a war — but never a single duel on his own terms.",
+        "weapon": "Gada",
+        "epithet": "Crown Prince, Gada King",
+    },
+
+    # ---- 5. BHISHMA : grandfather, oath-bound, iccha-mrityu
+    "BHISHMA PITAMAH": {
+        "name": "BHISHMA PITAMAH",
+        "color": (185, 190, 200),               # silver / white
+        "secondary_color": (230, 235, 245),     # bright silver
+        "health": 120,
+        "speed": 4,
+        "punch_damage": 9,
+        "kick_damage": 15,
+        "special_damage": 26,                   # PWR 26
+        "special_name": "PRATIGYA ASTRA",
+        "special_color": (210, 235, 255),       # icy oathsilver
+        "intro_dialogue": [
+            "Bhishma ka pratigya hai — satya par likha, khoon se nahi mitne wala!",
+            "Dono senaayein mere pota hain… aaj arthon ki baanh har dil ko chaati hai."
+        ],
+        "win_dialogue": "Pratigya nibh gayi — par jeet-haar se bada mera vachan hai.",
+        "lose_dialogue": "Sharson ka shayan tay hai… ab iccha mrityu ka samay dekhna hai.",
+        "special_dialogue": "PRATIGYA ASTRA! Meri kasam ka har baanh — akshay, anant, amar!",
+        "taunt": "Main shayan par baitha hoon aur phir bhi tum sabke guru hoon — utho, ladai seekho!",
+        "description": "Devavrata who became Bhishma — terrible for his terrible oath. "
+                       "Commander of the Kaurava host, master of every weapon, holder of "
+                       "iccha-mrityu: death only when he himself chooses it.",
+        "weapon": "Divine Bow",
+        "epithet": "Grandfather, Oathbound",
+    },
+
+    # ---- 6. ABHIMANYU : the chakravyuha breaker
+    "ABHIMANYU": {
+        "name": "ABHIMANYU",
+        "color": (0, 180, 210),                 # bright cyan
+        "secondary_color": (140, 240, 255),     # ice-cyan glow
+        "health": 85,
+        "speed": 8,
+        "punch_damage": 7,
+        "kick_damage": 11,
+        "special_damage": 20,                   # PWR 20
+        "special_name": "CHAKRAVYUHA BREAKER",
+        "special_color": (90, 240, 255),        # vortex cyan
+        "intro_dialogue": [
+            "Solah varsh ka balak hoon — par vyuh ka rahasya mere khoon mein hai!",
+            "Andar aana easy tha… bahar nikalna — wahi asli yuddh hai, jaan le!"
+        ],
+        "win_dialogue": "Chakravyuha mera hai aaj — aur aaj uska ant bhi mera hai!",
+        "lose_dialogue": "Saat veer ghair… par ek baanh yaad rakhegi — tu Abhimanyu ko bhulayega nahi.",
+        "special_dialogue": "CHAKRAVYUHA BREAKER! Ghoomti baanhon ka bhawansagar — jo andar gaya, woh bahar nahi!",
+        "taunt": "Vyuh rachna dekh raha hai? Main use todte hue bhi jeet jaata hoon!",
+        "description": "Arjuna's son, Subhadra's pride. He entered the impenetrable "
+                       "Chakravyuha alone as a boy of sixteen and made the greatest "
+                       "warriors of the age beg for combined honour.",
+        "weapon": "Sword & Bow",
+        "epithet": "Lotus of the Vortex",
+    },
+
+    # ---- 7. DRONACHARYA : guru of both armies
+    "DRONACHARYA": {
+        "name": "DRONACHARYA",
+        "color": (20, 110, 50),                 # forest green
+        "secondary_color": (90, 190, 120),      # leaf green
+        "health": 95,
+        "speed": 5,
+        "punch_damage": 8,
+        "kick_damage": 12,
+        "special_damage": 24,                   # PWR 24
+        "special_name": "NARAYANASTRA",
+        "special_color": (255, 200, 90),        # Vishnu's saffron-gold
+        "intro_dialogue": [
+            "Dono taraf mere shishya — kisi ko bachaunga nahi, kisi ko chhodunga nahi!",
+            "Guru dakshina ke liye yeh haath utha hain — aaj vidya ka fal chakhna padega."
+        ],
+        "win_dialogue": "Shishyo ko harana gurudakshina hai — vidyadaan pura hua.",
+        "lose_dialogue": "Ashwatthama… putra… guru bhi rota hai jab sansar dharm bhool jaata hai.",
+        "special_dialogue": "NARAYANASTRA! Vaikunth ki jyoti ka pravaah — ek baanh, anant roop!",
+        "taunt": "Maine tumhe yuddh sikhaya — aaj usi vidya se tumhant hota hai. Seekho, phir ladna!",
+        "description": "Drona, brahmin warrior and acharya of the Kuru princes — teacher "
+                       "of Arjuna and Karna alike. Bound by debt to Hastinapur, torn by "
+                       "love for his shishyas, master of the celestial Narayanastra.",
+        "weapon": "Divine Bow",
+        "epithet": "Guru of Both Armies",
+    },
+
+    # ---- 8. ASHWATTHAMA : the cursed immortal fury
+    "ASHWATTHAMA": {
+        "name": "ASHWATTHAMA",
+        "color": (130, 15, 40),                 # dark crimson
+        "secondary_color": (200, 60, 80),       # blood rose
+        "health": 115,
+        "speed": 5,
+        "punch_damage": 10,
+        "kick_damage": 15,
+        "special_damage": 27,                   # PWR 27
+        "special_name": "BRAHMASHIRA",
+        "special_color": (255, 60, 60),         # annihilation red
+        "intro_dialogue": [
+            "Maathe ki manik jagmagati hai — aur mere shraap ki aag ab bujhi nahi!",
+            "Guru ke pitra ka badla loonga — Brahmashira se, amar dard se!"
+        ],
+        "win_dialogue": "Jeet ka moh nahi — shraap amar hai, aur mera kaam abhi baaki hai.",
+        "lose_dialogue": "Haar? Mujhe haar nahi milti — bas yug baar-baar badal jaata hai.",
+        "special_dialogue": "BRAHMASHIRA! Srishti ka ant dene wali baanh — Madhava hi bacha sake toh bacha!",
+        "taunt": "Hazaron saal tak zameen par ghoothe rahega — aaj bas ek jhalak dekh le!",
+        "description": "Drona's son, avatar of Mahakala's fury, bearer of the forehead "
+                       "gem. After the Brahmashira he was cursed by Krishna to wander "
+                       "the earth, immortal and festering, until the end of the Kali Yuga.",
+        "weapon": "Divine Sword + Gem on forehead",
+        "epithet": "The Cursed Immortal",
+    },
+
+    # ---- 9. YUDHISHTHIRA : dharma's own son
+    "YUDHISHTHIRA": {
+        "name": "YUDHISHTHIRA",
+        "color": (235, 235, 225),               # pure white
+        "secondary_color": (240, 200, 90),      # gold trim
+        "health": 100,
+        "speed": 5,
+        "punch_damage": 6,
+        "kick_damage": 10,
+        "special_damage": 18,                   # PWR 18
+        "special_name": "DHARMA ASTRA",
+        "special_color": (255, 240, 170),       # righteous warm light
+        "intro_dialogue": [
+            "Dharmraj kehte hain mujhe — bhed nahi, bhay nahi, bas satya ka path!",
+            "Rajya mila, ladhna pada — kshama maangta hoon, par kadam nahi hataunga."
+        ],
+        "win_dialogue": "Dharma ki jeet hai yeh — Yudhishthira ne kuch nahi jeeta, sabko khoya hai.",
+        "lose_dialogue": "Satyavat hoke bhi haar jaun — toh phir satya hi ant mein jeetega.",
+        "special_dialogue": "DHARMA ASTRA! Jis paksha dharm ka, usi paksha yeh baanh — adharma ka naash!",
+        "taunt": "Main jhooth bolkar bhi rajya bacha sakta tha — tumhare liye toh sach hi kaafi hai!",
+        "description": "Son of Dharma, eldest Pandava, unshakeable in truth. His spear "
+                       "never sought glory — only justice; even Yamraja bowed before his "
+                       "uncompromising righteousness.",
+        "weapon": "Spear of Dharma",
+        "epithet": "Dharmraj, Son of Justice",
+    },
+
+    # ---- 10. SHAKUNI : the dice that drowned a kingdom
+    "SHAKUNI": {
+        "name": "SHAKUNI",
+        "color": (60, 100, 45),                 # sickly green
+        "secondary_color": (25, 28, 22),        # sooty black-green
+        "health": 75,
+        "speed": 7,
+        "punch_damage": 5,
+        "kick_damage": 9,
+        "special_damage": 15,                   # PWR 15
+        "special_name": "MAYA JAAL",
+        "special_color": (140, 220, 120),       # venomous illusion green
+        "intro_dialogue": [
+            "Paase phekta hoon — aur teen lok ka itihaas palat jaata hai!",
+            "Bal se nahi, buddhi se yuddh jeete jaate hain… tum dono haare hue lagte ho."
+        ],
+        "win_dialogue": "Jeet? Jeet toh wahi karta hai jiske paase uske niyam likhe hon.",
+        "lose_dialogue": "Ek chaal bigad gayi… par Shakuni ki sharti kabhi khatam nahi hoti.",
+        "special_dialogue": "MAYA JAAL! Jhooth ka jaal, sach ka dard — idhar dekho… nahin, Udhar dekho!",
+        "taunt": "Tum ladai lad rahe ho, main pehle se bahut khel chuka hoon — haaro mat, seekho!",
+        "description": "Master strategist of Gandhara and architect of the fateful game "
+                       "of dice. With loaded dice forged from his family's grief, one "
+                       "throw of his set the whole Mahabharat war ablaze.",
+        "weapon": "Enchanted Dice",
+        "epithet": "Rolls Fate, Weaves Lies",
+    },
+}
+
+
+
+# --- ROSTER: ordered view of the database for the selection grid ---------
+ROSTER = [CHARACTERS[key] for key in [
+    "ARJUNA", "KARNA", "BHIMA", "DURYODHANA", "BHISHMA PITAMAH",
+    "ABHIMANYU", "DRONACHARYA", "ASHWATTHAMA", "YUDHISHTHIRA", "SHAKUNI",
+]]
+
+
+def get_character(name):
+    """Look up a full character record by name (safe fallback)."""
+    return CHARACTERS.get(name, ROSTER[0])
+
 
 P1_KEYS = {pygame.K_a: "left", pygame.K_d: "right", pygame.K_w: "jump",
-           pygame.K_s: "block", pygame.K_f: "punch", pygame.K_g: "kick"}
+           pygame.K_s: "block", pygame.K_f: "punch", pygame.K_g: "kick",
+           pygame.K_t: "special"}
 P2_KEYS = {pygame.K_LEFT: "left", pygame.K_RIGHT: "right",
            pygame.K_UP: "jump", pygame.K_DOWN: "block",
-           pygame.K_k: "punch", pygame.K_l: "kick"}
+           pygame.K_k: "punch", pygame.K_l: "kick",
+           pygame.K_RETURN: "special"}
+
 
 
 # =====================================================================
 # SECTION 6: GAME STATES (the state machine scenes)
 # =====================================================================
+
+def wrap_text(text, font, max_w, max_lines=2):
+    """Greedy word-wrap helper used by dialogue banners & result lines."""
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        trial = (cur + " " + w).strip()
+        if font.size(trial)[0] <= max_w:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines[:max_lines]
+
 
 class GameState:
     """Base class for one scene of the state machine."""
@@ -484,7 +862,7 @@ class MenuState(GameState):
 
 
 class CharacterSelectState(GameState):
-    """Both players pick a warrior from the roster grid."""
+    """Both players pick a warrior from the roster grid (5 x 2 cards)."""
     name = STATE_CHARACTER_SELECT
 
     def __init__(self, game):
@@ -496,11 +874,11 @@ class CharacterSelectState(GameState):
 
     # -- helpers --
     def cell_rect(self, i):
-        """Grid: 3 columns x 2 rows of portrait cards."""
-        col, row = i % 3, i // 3
-        x = 180 + col * 300
-        y = 170 + row * 200
-        return pygame.Rect(x, y, 220, 160)
+        """Grid: 5 columns x 2 rows of portrait cards."""
+        col, row = i % 5, i // 5
+        x = 30 + col * 234
+        y = 150 + row * 178
+        return pygame.Rect(x, y, 210, 150)
 
     def handle_event(self, event):
         if event.type != pygame.KEYDOWN:
@@ -512,6 +890,10 @@ class CharacterSelectState(GameState):
             elif k == pygame.K_d:
                 self.p1_idx = (self.p1_idx + 1) % len(ROSTER)
             elif k == pygame.K_w:
+                self.p1_idx = (self.p1_idx - 5) % len(ROSTER)
+            elif k == pygame.K_s:
+                self.p1_idx = (self.p1_idx + 5) % len(ROSTER)
+            elif k in (pygame.K_RETURN, pygame.K_SPACE):
                 self.p1_ready = True
         if not self.p2_ready:
             if k == pygame.K_LEFT:
@@ -519,22 +901,60 @@ class CharacterSelectState(GameState):
             elif k == pygame.K_RIGHT:
                 self.p2_idx = (self.p2_idx + 1) % len(ROSTER)
             elif k == pygame.K_UP:
+                self.p2_idx = (self.p2_idx - 5) % len(ROSTER)
+            elif k == pygame.K_DOWN:
+                self.p2_idx = (self.p2_idx + 5) % len(ROSTER)
+            elif k in (pygame.K_RETURN, pygame.K_SPACE):
                 self.p2_ready = True
         if self.p1_ready and self.p2_ready:
-            if k == pygame.K_RETURN:
+            if k == pygame.K_KP_ENTER or k == pygame.K_g:
                 self.game.start_fight(ROSTER[self.p1_idx],
                                       ROSTER[self.p2_idx])
         if k == pygame.K_ESCAPE:
             self.game.change_state(STATE_MENU)
 
+    def _draw_stats_panel(self, target):
+        """Show hovered character's lore + stat bars at the bottom."""
+        hero = ROSTER[self.p1_idx]
+        py = 512
+        pygame.draw.rect(target, (18, 10, 26, 200),
+                         (20, py - 6, SCREEN_WIDTH - 40, 84),
+                         border_radius=10)
+        # name + weapon + epithet line
+        draw_centered_text(target,
+                           f"{hero['name']}  —  {hero['weapon']}",
+                           FONT_SMALL, SAFFRON, SCREEN_WIDTH // 2, py + 6)
+        desc = hero["description"]
+        if len(desc) > 118:
+            desc = desc[:116].rsplit(" ", 1)[0] + "…"
+        draw_centered_text(target, desc, FONT_SMALL, GREY,
+                           SCREEN_WIDTH // 2, py + 30)
+
+        # compact stat chips: HP / SPD / PWR(special) / punch / kick
+        chips = [(f"HP {hero['health']}", GREEN),
+                 (f"SPD {hero['speed']}", DARK_BLUE),
+                 (f"PWR {hero['special_damage']}", DEEP_RED),
+                 (f"SPECIAL: {hero['special_name']}", GOLD)]
+        total_w = sum(FONT_SMALL.size(t)[0] + 26 for t, _ in chips)
+        x = (SCREEN_WIDTH - total_w) // 2
+        for text, col in chips:
+            w = FONT_SMALL.size(text)[0] + 22
+            chip = pygame.Rect(x, py + 52, w, 24)
+            pygame.draw.rect(target, (40, 25, 55), chip, border_radius=8)
+            pygame.draw.rect(target, col, chip, 2, border_radius=8)
+            img = FONT_SMALL.render(text, True, col if col != GOLD else GOLD)
+            target.blit(img, (chip.x + 11, chip.y + 3))
+            x += w + 4
+
     def draw(self, target):
         self.game.background.draw(target)
         draw_centered_text(target, "CHOOSE YOUR WARRIOR", FONT_LARGE,
-                           GOLD, SCREEN_WIDTH // 2, 60, shadow=True)
+                           GOLD, SCREEN_WIDTH // 2, 40, shadow=True)
         draw_centered_text(target,
-                           "P1: A/D move, W confirm    |    "
-                           "P2: ARROWS move, UP confirm",
-                           FONT_SMALL, WHITE, SCREEN_WIDTH // 2, 115)
+                           "P1: A/D/W/S move, ENTER confirm    |    "
+                           "P2: ARROWS move, SPACE confirm    |    "
+                           "ENTER+G when both ready",
+                           FONT_SMALL, WHITE, SCREEN_WIDTH // 2, 95)
 
         for i, hero in enumerate(ROSTER):
             r = self.cell_rect(i)
@@ -551,55 +971,73 @@ class CharacterSelectState(GameState):
                                  border_radius=10)
 
             # mini portrait: coloured circle "warrior" bust
-            pcx, pcy = r.centerx, r.centery - 15
-            pygame.draw.circle(target, hero["accent"], (pcx, pcy), 26)
+            pcx, pcy = r.centerx, r.centery - 20
+            pygame.draw.circle(target, hero["secondary_color"],
+                               (pcx, pcy), 24)
             pygame.draw.rect(target, hero["color"],
-                             (pcx - 20, pcy + 18, 40, 30), border_radius=6)
-            pygame.draw.polygon(target, GOLD, [(pcx - 14, pcy - 18),
-                                               (pcx, pcy - 38),
-                                               (pcx + 14, pcy - 18)])
+                             (pcx - 19, pcy + 16, 38, 28), border_radius=6)
+            pygame.draw.polygon(target, GOLD, [(pcx - 13, pcy - 16),
+                                               (pcx, pcy - 34),
+                                               (pcx + 13, pcy - 16)])
 
-            draw_centered_text(target, hero["name"], FONT_SMALL, WHITE,
-                               r.centerx, r.bottom - 38)
+            name_c = WHITE if i != self.p1_idx else SAFFRON
+            draw_centered_text(target, hero["name"], FONT_SMALL, name_c,
+                               r.centerx, r.bottom - 36)
             draw_centered_text(target, hero["epithet"], FONT_SMALL,
-                               GREY, r.centerx, r.bottom - 16)
+                               GREY, r.centerx, r.bottom - 14)
 
         # selection tags floating over chosen cards
-        for idx, ready, label, col in ((self.p1_idx, self.p1_ready, "P1",
-                                        SAFFRON),
-                                       (self.p2_idx, self.p2_ready, "P2",
-                                        DARK_BLUE)):
+        for idx, ready, label in ((self.p1_idx, self.p1_ready, "P1"),
+                                  (self.p2_idx, self.p2_ready, "P2")):
             r = self.cell_rect(idx)
             tag = FONT_SMALL.render(
                 f"{label}: {'READY!' if ready else 'select'}", True,
-                GOLD if col is SAFFRON else WHITE)
-            if col is DARK_BLUE:
-                tag = FONT_SMALL.render(
-                    f"{label}: {'READY!' if ready else 'select'}", True,
-                    WHITE)
-            target.blit(tag, (r.x + 4, r.y - 26))
+                SAFFRON if label == "P1" else WHITE)
+            target.blit(tag, (r.x + 4, r.y - 24))
+
+        self._draw_stats_panel(target)
 
         if self.p1_ready and self.p2_ready:
             if blink_visible(pygame.time.get_ticks()):
-                draw_centered_text(target, "Press ENTER to Begin the War!",
+                draw_centered_text(target,
+                                   "Press ENTER then G to Begin the War!",
                                    FONT_MEDIUM, GREEN, SCREEN_WIDTH // 2,
-                                   560, shadow=True)
+                                   470, shadow=True)
 
 
 class FightState(GameState):
-    """Real-time combat between the two selected fighters."""
+    """Real-time combat between the two selected fighters.
+
+    All stats, weapons and dialogues come from the CHARACTERS database:
+      intro_dialogue  -> shown during the "FIGHT!" banner
+      special_dialogue-> shouted when the astral weapon is unleashed
+      taunt           -> occasional mid-fight shout-outs
+      win/lose_dialogue -> handed to the result screen
+    """
     name = STATE_FIGHT
 
     def __init__(self, game, p1_data, p2_data):
         super().__init__(game)
         self.f1 = Fighter(p1_data["name"], p1_data["color"],
-                          p1_data["accent"], 300, 1, P1_KEYS)
+                          p1_data["secondary_color"], 300, 1, P1_KEYS,
+                          data=p1_data)
         self.f2 = Fighter(p2_data["name"], p2_data["color"],
-                          p2_data["accent"], 900, -1, P2_KEYS)
+                          p2_data["secondary_color"], 900, -1, P2_KEYS,
+                          data=p2_data)
         self.round_start = pygame.time.get_ticks()
         self.winner = None
         self.end_delay_until = None
         self.hit_sparks = []          # (x, y, frames_left, color)
+        self.banner = None            # (text, colour, expires_ms)
+        self.taunt_at = pygame.time.get_ticks() + random.randint(6000, 9000)
+        # dramatic pre-fight exchange (2 intro lines from the database)
+        intro = (p1_data["intro_dialogue"][0] + "   ||   " +
+                 p2_data["intro_dialogue"][0])
+        self.set_banner(intro, SAFFRON, 4500)
+
+    # ---------- helpers ----------
+    def set_banner(self, text, color=WHITE, ms=2800):
+        self.banner = (text, color, pygame.time.get_ticks() + ms)
 
     def handle_event(self, event):
         if event.type == pygame.KEYDOWN:
@@ -626,14 +1064,18 @@ class FightState(GameState):
                                 f.state in ("idle", "walk"):
                             f.state = "block"
                             f.state_timer = 20
+                        elif action == "special":
+                            if f.start_special():
+                                self.set_banner(f.data["special_dialogue"],
+                                                f.special_color, 2600)
 
     def _process_movement(self):
-        """Continuous movement while keys held down."""
+        """Continuous movement while keys held down — at each warrior's speed."""
         pressed = pygame.key.get_pressed()
         for f in (self.f1, self.f2):
             if f.controls is None or self.winner:
                 continue
-            speed = 6
+            speed = max(2, f.speed)
             moving = False
             for key, action in f.controls.items():
                 if pressed[key]:
@@ -650,7 +1092,7 @@ class FightState(GameState):
                 f.state = "walk"
 
     def _resolve_hits(self):
-        """Check active attacks against the opponent's hitbox."""
+        """Check active melee attacks against the opponent's hitbox."""
         for attacker, defender in ((self.f1, self.f2), (self.f2, self.f1)):
             if attacker.state not in ("punch", "kick") or attacker.attack_hit:
                 continue
@@ -670,23 +1112,54 @@ class FightState(GameState):
                 else:
                     spark_col = DEEP_RED
                 defender.take_hit(dmg, attacker.facing)
+                attacker.special_meter = min(100, attacker.special_meter +
+                                             dmg * 1.6)
                 self.hit_sparks.append((attacker.x + attacker.facing *
                                         reach * 0.7,
                                         GROUND_Y - defender.y - 110,
                                         12, spark_col))
 
+    def _resolve_projectiles(self):
+        """Astral weapon blasts fly across the field until they connect."""
+        for f in (self.f1, self.f2):
+            foe = self.f2 if f is self.f1 else self.f1
+            for pr in list(f.projectiles):
+                pr["x"] += pr["vx"]
+                rect = pygame.Rect(int(pr["x"]) - 20, int(pr["y"]) - 20,
+                                   40, 40)
+                if rect.colliderect(foe.get_hitbox()):
+                    foe.take_hit(f.special_damage, f.facing)
+                    self.hit_sparks.append((pr["x"], pr["y"], 16,
+                                            f.special_color))
+                    f.projectiles.remove(pr)
+                elif pr["x"] < -40 or pr["x"] > SCREEN_WIDTH + 40:
+                    f.projectiles.remove(pr)
+
     def update(self, dt):
+        now = pygame.time.get_ticks()
         if not self.winner:
             self._process_movement()
             self.f1.update(self.f2)
             self.f2.update(self.f1)
             self._resolve_hits()
+            self._resolve_projectiles()
+            # occasional taunts straight out of the character database
+            if now >= self.taunt_at:
+                self.taunt_at = now + random.randint(9000, 14000)
+                shouter = random.choice((self.f1, self.f2))
+                self.set_banner(shouter.data["taunt"], GREY, 2400)
             if self.f1.health <= 0 or self.f2.health <= 0:
                 self.winner = self.f1 if self.f1.health > 0 else self.f2
-                self.end_delay_until = pygame.time.get_ticks() + 2200
+                loser = self.f2 if self.winner is self.f1 else self.f1
+                self.game.result_win_line = self.winner.data["win_dialogue"]
+                self.game.result_lose_line = loser.data["lose_dialogue"]
+                self.set_banner(self.winner.data["win_dialogue"], GOLD, 3000)
+                self.end_delay_until = now + 2600
+        if self.banner and now > self.banner[2]:
+            self.banner = None
         self.hit_sparks = [(x, y, t - 1, c) for x, y, t, c in
                            self.hit_sparks if t > 1]
-        if self.winner and pygame.time.get_ticks() >= self.end_delay_until:
+        if self.winner and now >= self.end_delay_until:
             self.game.result_winner = self.winner.name
             self.game.change_state(STATE_RESULT)
 
@@ -694,6 +1167,18 @@ class FightState(GameState):
         self.game.background.draw(target)
         self.f1.draw(target)
         self.f2.draw(target)
+
+        # astral projectiles (each fighter's special_color, glowing comet)
+        for f in (self.f1, self.f2):
+            for pr in f.projectiles:
+                px, py = int(pr["x"]), int(pr["y"])
+                col = f.special_color
+                for r, a in ((26, 90), (18, 160), (10, 255)):
+                    glow = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+                    pygame.draw.circle(glow, (*col, a), (r, r), r)
+                    target.blit(glow, (px - r, py - r))
+                pygame.draw.line(target, col,
+                                 (px - int(pr["vx"]) * 2, py), (px, py), 4)
 
         # hit sparks
         for x, y, t, c in self.hit_sparks:
@@ -704,6 +1189,7 @@ class FightState(GameState):
             target.blit(spark, (x - rad, y - rad))
 
         self._draw_hud(target)
+        self._draw_banner(target)
 
         # "FIGHT!" banner for first second
         elapsed = pygame.time.get_ticks() - self.round_start
@@ -715,6 +1201,25 @@ class FightState(GameState):
             draw_centered_text(target, f"{self.winner.name} WINS!",
                                FONT_LARGE, GOLD, SCREEN_WIDTH // 2, 250,
                                shadow=True)
+
+    def _draw_banner(self, target):
+        """Dialogue ribbon near the bottom — intros / specials / taunts."""
+        if not self.banner:
+            return
+        text, color, _ = self.banner
+        lines = wrap_text(text, FONT_SMALL, SCREEN_WIDTH - 160)
+        h = 22 * len(lines) + 18
+        box = pygame.Surface((SCREEN_WIDTH - 120, h), pygame.SRCALPHA)
+        pygame.draw.rect(box, (12, 6, 18, 210), box.get_rect(),
+                         border_radius=10)
+        pygame.draw.rect(box, (*color, 255), box.get_rect(), 2,
+                         border_radius=10)
+        target.blit(box, (60, 490 - h))
+        y = 490 - h + 8
+        for ln in lines:
+            draw_centered_text(target, ln, FONT_SMALL, color,
+                               SCREEN_WIDTH // 2, y)
+            y += 22
 
     def _draw_hud(self, target):
         bar_w, bar_h = 420, 26
@@ -736,20 +1241,47 @@ class FightState(GameState):
                 pygame.draw.rect(target, color,
                                  (x + bar_w - fill_w, 30, fill_w, bar_h),
                                  border_radius=5)
-            name_img = FONT_SMALL.render(f.name, True, WHITE)
-            target.blit(name_img, (x, 60) if align_left else
-                        (x + bar_w - name_img.get_width(), 60))
+            # special meter under the health bar (fills the astral weapon)
+            m_ratio = f.special_meter / 100.0
+            m_fill = int(bar_w * m_ratio)
+            pygame.draw.rect(target, (30, 30, 45), (x, 58, bar_w, 8),
+                             border_radius=4)
+            ready = m_ratio >= 1.0
+            m_col = GOLD if ready else f.special_color
+            if align_left:
+                pygame.draw.rect(target, m_col, (x, 58, m_fill, 8),
+                                 border_radius=4)
+            else:
+                pygame.draw.rect(target, m_col,
+                                 (x + bar_w - m_fill, 58, m_fill, 8),
+                                 border_radius=4)
+            name_img = FONT_SMALL.render(
+                f"{f.name} [{f.weapon}]", True, WHITE)
+            tag = " ★ READY" if ready else ""
+            if tag:
+                tag_img = FONT_SMALL.render(tag, True, GOLD)
+                if blink_visible(pygame.time.get_ticks()):
+                    if align_left:
+                        target.blit(tag_img, (x + name_img.get_width() + 8,
+                                              70))
+                    else:
+                        target.blit(tag_img,
+                                    (x + bar_w - tag_img.get_width(), 70))
+            target.blit(name_img, (x, 70) if align_left else
+                        (x + bar_w - name_img.get_width(), 70))
         # VS emblem
         draw_centered_text(target, "VS", FONT_MEDIUM, GOLD,
                            SCREEN_WIDTH // 2, 42, shadow=True)
         # control reminder
         draw_centered_text(target,
-                           "P1: A/D W S F G     P2: ARROWS K L     ESC: menu",
+                           "P1: A/D W S F G T(special)   |   "
+                           "P2: ARROWS K L ENTER(special)   |   ESC: menu",
                            FONT_SMALL, GREY, SCREEN_WIDTH // 2, 580)
 
 
 class ResultState(GameState):
-    """Victory screen after the fight ends."""
+    """Victory screen — shows the winner's win_dialogue and the
+    loser's lose_dialogue, both pulled from the CHARACTERS database."""
     name = STATE_RESULT
 
     def __init__(self, game):
@@ -766,19 +1298,38 @@ class ResultState(GameState):
     def draw(self, target):
         self.game.background.draw(target)
         winner = getattr(self.game, "result_winner", "WARRIOR")
+        win_line = getattr(self.game, "result_win_line", None)
+        lose_line = getattr(self.game, "result_lose_line", None)
+
         draw_centered_text(target, "VICTORY", FONT_LARGE, GOLD,
-                           SCREEN_WIDTH // 2, 150, shadow=True)
+                           SCREEN_WIDTH // 2, 80, shadow=True)
         draw_centered_text(target, f"{winner} claims the field at "
                                    "Kurukshetra!",
-                           FONT_MEDIUM, SAFFRON, SCREEN_WIDTH // 2, 250,
+                           FONT_MEDIUM, SAFFRON, SCREEN_WIDTH // 2, 160,
                            shadow=True)
         # laurel-ish decoration
         pygame.draw.arc(target, GOLD,
-                        (SCREEN_WIDTH // 2 - 180, 300, 160, 200),
+                        (SCREEN_WIDTH // 2 - 180, 190, 160, 150),
                         math.pi * 0.75, math.pi * 1.6, 4)
         pygame.draw.arc(target, GOLD,
-                        (SCREEN_WIDTH // 2 + 20, 300, 160, 200),
+                        (SCREEN_WIDTH // 2 + 20, 190, 160, 150),
                         math.pi * 1.4, math.pi * 2.25, 4)
+
+        # dialogue couplet from the character database (wrapped to fit)
+        y = 260
+        if win_line:
+            for ln in wrap_text('"' + win_line + '"', FONT_SMALL,
+                                SCREEN_WIDTH - 140, max_lines=3):
+                draw_centered_text(target, ln, FONT_SMALL, GREEN,
+                                   SCREEN_WIDTH // 2, y)
+                y += 26
+            y += 12
+        if lose_line:
+            for ln in wrap_text('"' + lose_line + '"', FONT_SMALL,
+                                SCREEN_WIDTH - 140, max_lines=3):
+                draw_centered_text(target, ln, FONT_SMALL, GREY,
+                                   SCREEN_WIDTH // 2, y)
+                y += 26
 
         now = pygame.time.get_ticks() - self.enter_time
         if blink_visible(now):
