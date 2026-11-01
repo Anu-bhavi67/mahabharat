@@ -1096,6 +1096,10 @@ class Fighter:
         # ---- pose / physics state ----
         self.x = float(x)
         self.y = float(y)               # height above GROUND_Y
+        # ---- SOUND SYSTEM: remember the spawn height so the landing
+        # "thud" (play_sound("jump")) only fires after a REAL jump,
+        # never on the round-reset snap back to the floor.
+        self._prev_y = float(y)
         self.vel_y = 0.0                # vertical velocity (jump physics)
         self.vx = 0.0                   # knockback slide velocity
         self.vy = 0.0                   # knockback LIFT velocity (air pop)
@@ -1350,6 +1354,8 @@ class Fighter:
 
         # ---- drain the meter completely ----
         self.special_meter = 0.0
+        # SOUND TRIGGER: per-character astral cue ("special_arjuna" etc.)
+        play_sound("special_" + self.name.lower())
         # channeling pose: arms thrust forward, melee box must NOT connect
         self.state = "punch"
         self.attack_total = CAST_FRAMES
@@ -1651,10 +1657,21 @@ class Fighter:
             self.health = max(0, self.health - applied)
             self.block_stun = self.BLOCK_STUN_FRAMES      # 10 frozen frames
             self.vx = facing_in * 3                        # small push-back
+            play_sound("block")                            # SOUND TRIGGER
             if self.fx is not None:                        # gold guard sparks
                 self.fx.create_hit_sparks(self.x + facing_in * 30,
                                           chest_y, GOLD, count=8)
             return applied
+
+        # ---- SOUND TRIGGERS: impact cue for the incoming blow ----------
+        # punch/kick sounds fire where the attack lands (FightState);
+        # astral projectiles and instant specials announce themselves with
+        # their per-character cue; everything that bleeds HP also plays
+        # the generic "hit" thud.
+        if getattr(attacker, "_special_credit", None) or \
+                getattr(attacker, "is_channeling", False):
+            play_sound("special_" + attacker.name.lower())
+        play_sound("hit")
 
         applied = int(dmg)
         self.health = max(0, self.health - applied)
@@ -1680,6 +1697,7 @@ class Fighter:
             self.state_timer = 0
             self.vx = facing_in * 7
             self.vy = 4                                    # dramatic pop-up
+            play_sound("ko")                               # SOUND TRIGGER
             if self.fx is not None:                        # KO spectacle
                 self.fx.flash(FLASH_FRAMES + 2)
                 self.fx.shake(24, 12)
@@ -1749,11 +1767,18 @@ class Fighter:
             self.vy -= GRAVITY * 0.6          # knockback lift falls sooner
             self.y += self.vel_y + self.vy
             if self.y <= 0:                   # touched down on the ground
+                landed_high = self._prev_y    # height before this step
                 self.y, self.vel_y, self.vy = 0.0, 0.0, 0.0
                 if self.state == "jump":
                     self.state = "idle"
                 if self.fx is not None:       # landing dust puff
                     self.fx.create_ground_dust(self.x, GROUND_Y - 4)
+                # SOUND TRIGGER: fighter lands after a real jump -> thud.
+                # (Only fires when they were genuinely airborne, so round
+                #  resets and spawn snaps stay silent.)
+                if landed_high > 24.0:
+                    play_sound("jump")
+        self._prev_y = self.y
         self.was_airborne = airborne
 
     def _emit_fx(self):
@@ -3888,6 +3913,8 @@ class GameState:
                 combo = f.register_hit(blocked=was_blocking)
                 if combo >= 2:
                     self.combo_pops.append((f, f"{combo} HIT COMBO!", 70))
+                if combo >= 3:                     # SOUND TRIGGER: combo 3+
+                    play_sound("combo")
                 self.hit_sparks.append((foe.x, GROUND_Y - foe.y - 100,
                                         16, f.special_color))
                 self.fx.spawn(foe.x, GROUND_Y - foe.y - 100,
@@ -4839,6 +4866,12 @@ class FightState(GameState):
         # "dyut_sabha"/"chakravyuha"); arcade bouts fall back to the
         # default sunset plains of Kurukshetra.
         self.stage_name = getattr(game, "story_stage", None) or "kurukshetra"
+        # SOUND TRIGGERS: battle music for THIS stage (falls back to the
+        # generic "battle" track name if no per-stage file is present —
+        # SoundManager tries both before resorting to silence/beeps), and
+        # the round-start cue when the announcer shouts "FIGHT!".
+        play_bgm("battle_" + self.stage_name)
+        self._round_start_cued = False     # armed once controls unlock
         self._intro_build(p1_data, p2_data)
         if self.show_intro:
             self._intro_start("FADE")
@@ -5318,6 +5351,9 @@ class FightState(GameState):
             attacker.attack_hit = True
             raw_dmg = attacker.current_damage()
             was_blocking = defender.state == "block"
+            # SOUND TRIGGER: the swing itself (punch / kick) connects...
+            play_sound(attacker.state if attacker.state in ("punch", "kick")
+                       else "hit")
             applied = defender.take_hit(raw_dmg, attacker)
 
             # ---- DAMAGE SYSTEM: meter gain = 1.5x damage actually dealt --
@@ -5328,6 +5364,8 @@ class FightState(GameState):
             if combo >= 2:
                 self.combo_pops.append(
                     (attacker, f"{combo} HIT COMBO!", 70))
+            if combo >= 3:                     # SOUND TRIGGER: combo 3+
+                play_sound("combo")
 
             spark_col = GOLD if was_blocking else DEEP_RED
             self.hit_sparks.append((
@@ -5359,6 +5397,8 @@ class FightState(GameState):
                     if combo >= 2:
                         self.combo_pops.append(
                             (f, f"{combo} HIT COMBO!", 70))
+                    if combo >= 3:                 # SOUND TRIGGER: combo 3+
+                        play_sound("combo")
                     self.hit_sparks.append((pr["x"], pr["y"], 16,
                                             f.special_color))
                     # impact explosion in the astral's colour
@@ -5393,6 +5433,14 @@ class FightState(GameState):
         now = pygame.time.get_ticks()
         self.fight_frame += 1          # master frame clock (60 FPS)
         intro_left = (now - self.round_start) < 1400
+        # SOUND TRIGGER: the "FIGHT!" announcer cue, fired exactly once
+        # per round the moment controls unlock (also re-armed by the
+        # round reset in _begin_next_round).
+        if intro_left:
+            self._round_start_cued = False
+        elif not self._round_start_cued and not self.winner:
+            self._round_start_cued = True
+            play_sound("round_start")
         self.hud_freeze = bool(self.winner) or intro_left
         if not self.hud_freeze:
             # ---- TIMER: 99-second countdown, only while the fight is live
@@ -5505,6 +5553,9 @@ class FightState(GameState):
         # best of 3: two round wins ends the match
         if self.round_wins[w] >= 2:
             self.match_over = True
+            # SOUND TRIGGER: the bout is decided -> victory music takes
+            # over from the battle loop (fade-style stop, then load).
+            play_bgm("victory")
 
     def _reset_fighter(self, f, facing):
         """Put one fighter back to its starting stance for a new round.
