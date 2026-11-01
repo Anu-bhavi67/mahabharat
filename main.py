@@ -82,6 +82,7 @@ FONT_COMBO  = pygame.font.SysFont("arial", 34, bold=True)   # "X HIT COMBO!"
 FONT_MEDIUM = pygame.font.SysFont("arial", 32, bold=True)
 FONT_LARGE  = pygame.font.SysFont("arial", 64, bold=True)
 FONT_TITLE  = pygame.font.SysFont("arial", 72, bold=True)
+FONT_XL     = pygame.font.SysFont("arial", 96, bold=True)
 
 
 # =====================================================================
@@ -117,6 +118,21 @@ def draw_centered_text(surface, text, font, color, x, y, shadow=False):
 def blink_visible(elapsed_ms, period_ms=1000, duty=0.55):
     """Return True during the 'on' phase of a blink cycle."""
     return (elapsed_ms % period_ms) < period_ms * duty
+
+
+def wrap_text(text, font, max_w, max_lines=2):
+    """Greedy word-wrap helper used by dialogue banners & result lines."""
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        trial = (cur + " " + w).strip()
+        if font.size(trial)[0] <= max_w:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines[:max_lines]
 
 
 # =====================================================================
@@ -740,6 +756,13 @@ class Fighter:
         # aura motes all over the place without a constructor change.
         self.fx = None                      # set by FightState per fighter
         self.was_airborne = False           # for landing-dust detection
+        # ---- DIALOGUE & CINEMATIC INTRO SYSTEM hooks ----------------
+        # intro_lock   : True while the pre-fight cinematic plays — the
+        #                fighter keeps animating but cannot act or fall.
+        # draw_scale   : slow zoom factor used by the cinematic spotlight
+        #                shots (1.0 == normal size).
+        self.intro_lock = False
+        self.draw_scale = 1.0
 
     # ------------------------------------------------------------------
     # COMBAT TIMING CONSTANTS (per spec)
@@ -854,9 +877,12 @@ class Fighter:
             self.state = "idle"
 
     def _busy(self):
-        """States that lock out every other action (hit stun included)."""
+        """States that lock out every other action (hit stun included).
+
+        The cinematic intro lock also counts as busy so nobody can move,
+        jump or swing while the spotlight dialogue is playing."""
         return (self.state in ("punch", "kick", "hurt", "ko")
-                or self.block_stun > 0)
+                or self.block_stun > 0 or self.intro_lock)
 
     # ---------- combat: attacks ----------
     def start_attack(self, kind):
@@ -1532,7 +1558,9 @@ class Fighter:
         if "Kavach" in wpn or "Gem" in wpn:  # divine armour / forehead gem
             pygame.draw.circle(target, GOLD, (cx + f * 4, foot_y - 146), 4)
 
-    def draw(self, target):
+    def _draw_body(self, target):
+        """Core procedural warrior rendering (head, torso, limbs, weapon,
+        aura, hit-flash, KO slump, name tag).  Wrapped by draw()."""
         f = self.facing
         cx = int(self.x)
         foot_y = int(GROUND_Y - self.y)
@@ -1740,6 +1768,32 @@ class Fighter:
         draw_centered_text(target, label, FONT_SMALL, WHITE, cx,
                            foot_y - STAND_HEIGHT - 38, shadow=True)
 
+    def draw(self, target):
+        """Draw the warrior, honouring the cinematic `draw_scale`.
+
+        During the pre-fight spotlight shots FightState animates a slow
+        zoom-in; we render the body onto a transparent canvas and scale
+        it about the fighter's FEET so the camera push-in never lifts or
+        sinks the character off the ground line."""
+        s = float(getattr(self, "draw_scale", 1.0))
+        if abs(s - 1.0) < 0.004:
+            self._draw_body(target)
+            return
+        pad_x, pad_top, pad_bottom = 190, 70, 46
+        w = int(SCREEN_WIDTH + pad_x * 2)
+        h = int(SCREEN_HEIGHT + pad_top + pad_bottom)
+        canvas = pygame.Surface((w, h), pygame.SRCALPHA)
+        self._draw_body(canvas)
+        sw, sh = max(1, int(w * s)), max(1, int(h * s))
+        zoomed_canvas = pygame.transform.smoothscale(canvas, (sw, sh))
+        # keep the feet planted at the same screen point while zooming
+        fx, fy = int(self.x), int(GROUND_Y - self.y)
+        # feet sit at (pad_x + fx, pad_top + fy) on the off-screen canvas;
+        # after scaling they must land back on that same screen point
+        dx = int((pad_x + fx) * (1.0 - s))
+        dy = int((pad_top + fy) * (1.0 - s))
+        target.blit(zoomed_canvas, (dx, dy))
+
 
 # =====================================================================
 # SECTION 5: CHARACTER DATABASE — the 10 legendary warriors of the epic
@@ -1772,6 +1826,7 @@ CHARACTERS = {
         "win_dialogue": "Jeet meri nahi, Keshav ki saarthi mein hai — rathi safal hua.",
         "lose_dialogue": "Haar gaya… par Krishna ka rath kabhi haar nahi maanta.",
         "special_dialogue": "BRAHMASTRA! Ek baanh, ek divya aag — Agni bhi shant ho jaaye!",
+        "low_hp_dialogue": "Krishna, guide my arrow… haath kaanp rahe hain, par lakshya nahi!",
         "taunt": "Paanch senaon ko akela jhel chuka hoon — tu kaun? Ek baanh, khatam!",
         "description": "Pandava prince and invincible archer, student of Drona, "
                        "friend of Krishna. With the celestial bow Gandiva he never "
@@ -1799,6 +1854,7 @@ CHARACTERS = {
         "win_dialogue": "Vijaya ne sach bola — vidhataan aaj mere paksha jhuk gayi!",
         "lose_dialogue": "Shraap toh lagta hi hai mere naam par… phir bhi ladta rahunga.",
         "special_dialogue": "SHAKTI ASTRA! Rudra ka garaj le kar aaya hoon — dekh, aakash jhuk jaata hai!",
+        "low_hp_dialogue": "Mera kavach… gaya! Shraap ka samay aa gaya… phir bhi main jhukunga nahi!",
         "taunt": "Daan mein sab kuch deta hoon — aaj tujhe daan mein teri haar milenge!",
         "description": "Radheya — sun-born warrior, king of Anga, sworn friend of "
                        "Duryodhana. Born with divine armour and earrings, cursed yet "
@@ -1826,6 +1882,7 @@ CHARACTERS = {
         "win_dialogue": "Gada chali, dharti kaanpi — adharma ka hisaab barabar!",
         "lose_dialogue": "Yeh gada thak gayi… par Bhima ka gussa kabhi nahi thakta.",
         "special_dialogue": "MAHAGADA PRHAR! Aasman-zameen ek ho jaayega — uth, aur dekh Dhartiraj kaanpte hue!",
+        "low_hp_dialogue": "Duryodhana… yeh dard tera karz hai! Bhima abhi zinda hai — gada abhi zinda hai!",
         "taunt": "Aaj tere paas do raaste hain — bhaag, ya mera naashta ban ja!",
         "description": "Mightiest of the Pandavas, son of the Wind God Vayu. Wielder "
                        "of the giant gada, slayer of Keechaka and Dushasana — his rage "
@@ -1853,6 +1910,7 @@ CHARACTERS = {
         "win_dialogue": "Dekha? Jis gada ne Bharat jeeta, woh tukde-tukde karti hai rakht ko!",
         "lose_dialogue": "Ranbhoomi mein gira raja… par Hastinapur ka ahankaar kabhi nahi marta.",
         "special_dialogue": "MAYAVI GADA! Mayavi vaar — kahan se aayi gada? Jahan dekhega, wahin tootega!",
+        "low_hp_dialogue": "Rajya ke liye rota nahi Duryodhana… par aaj ranbhoomi sharminda kar rahi hai!",
         "taunt": "Ekla chala re? Aaj ekla CHALU main hoon — aur tu hawa mein ud jaayega!",
         "description": "Kaurava emperor, invincible mace-fighter, shielded by "
                        "Shakuni's cunning and feared even by Bhishma. His pride lost "
@@ -1880,6 +1938,7 @@ CHARACTERS = {
         "win_dialogue": "Pratigya nibh gayi — par jeet-haar se bada mera vachan hai.",
         "lose_dialogue": "Sharson ka shayan tay hai… ab iccha mrityu ka samay dekhna hai.",
         "special_dialogue": "PRATIGYA ASTRA! Meri kasam ka har baanh — akshay, anant, amar!",
+        "low_hp_dialogue": "Sharson ka shayan bulata hai… pratigya adhoori hai, mrityu abhi nahi!",
         "taunt": "Main shayan par baitha hoon aur phir bhi tum sabke guru hoon — utho, ladai seekho!",
         "description": "Devavrata who became Bhishma — terrible for his terrible oath. "
                        "Commander of the Kaurava host, master of every weapon, holder of "
@@ -1907,6 +1966,7 @@ CHARACTERS = {
         "win_dialogue": "Chakravyuha mera hai aaj — aur aaj uska ant bhi mera hai!",
         "lose_dialogue": "Saat veer ghair… par ek baanh yaad rakhegi — tu Abhimanyu ko bhulayega nahi.",
         "special_dialogue": "CHAKRAVYUHA BREAKER! Ghoomti baanhon ka bhawansagar — jo andar gaya, woh bahar nahi!",
+        "low_hp_dialogue": "Saat veer ghair hain… par ek Abhimanyu abhi zinda hai — vyuh abhi nahi jita!",
         "taunt": "Vyuh rachna dekh raha hai? Main use todte hue bhi jeet jaata hoon!",
         "description": "Arjuna's son, Subhadra's pride. He entered the impenetrable "
                        "Chakravyuha alone as a boy of sixteen and made the greatest "
@@ -1934,6 +1994,7 @@ CHARACTERS = {
         "win_dialogue": "Shishyo ko harana gurudakshina hai — vidyadaan pura hua.",
         "lose_dialogue": "Ashwatthama… putra… guru bhi rota hai jab sansar dharm bhool jaata hai.",
         "special_dialogue": "NARAYANASTRA! Vaikunth ki jyoti ka pravaah — ek baanh, anant roop!",
+        "low_hp_dialogue": "Shishya hi vidyarthi ka ant likhe… guru aaj bhool gaya — ya bhulaya gaya!",
         "taunt": "Maine tumhe yuddh sikhaya — aaj usi vidya se tumhant hota hai. Seekho, phir ladna!",
         "description": "Drona, brahmin warrior and acharya of the Kuru princes — teacher "
                        "of Arjuna and Karna alike. Bound by debt to Hastinapur, torn by "
@@ -1961,6 +2022,7 @@ CHARACTERS = {
         "win_dialogue": "Jeet ka moh nahi — shraap amar hai, aur mera kaam abhi baaki hai.",
         "lose_dialogue": "Haar? Mujhe haar nahi milti — bas yug baar-baar badal jaata hai.",
         "special_dialogue": "BRAHMASHIRA! Srishti ka ant dene wali baanh — Madhava hi bacha sake toh bacha!",
+        "low_hp_dialogue": "Yeh dard… hazaron saal ka shraap jhaank raha hai — par mera kaam abhi baaki!",
         "taunt": "Hazaron saal tak zameen par ghoothe rahega — aaj bas ek jhalak dekh le!",
         "description": "Drona's son, avatar of Mahakala's fury, bearer of the forehead "
                        "gem. After the Brahmashira he was cursed by Krishna to wander "
@@ -1988,6 +2050,7 @@ CHARACTERS = {
         "win_dialogue": "Dharma ki jeet hai yeh — Yudhishthira ne kuch nahi jeeta, sabko khoya hai.",
         "lose_dialogue": "Satyavat hoke bhi haar jaun — toh phir satya hi ant mein jeetega.",
         "special_dialogue": "DHARMA ASTRA! Jis paksha dharm ka, usi paksha yeh baanh — adharma ka naash!",
+        "low_hp_dialogue": "Satyavat hoke bhi dard hota hai… par dharm ka raasta kabhi chhoda nahi jaata.",
         "taunt": "Main jhooth bolkar bhi rajya bacha sakta tha — tumhare liye toh sach hi kaafi hai!",
         "description": "Son of Dharma, eldest Pandava, unshakeable in truth. His spear "
                        "never sought glory — only justice; even Yamraja bowed before his "
@@ -2015,6 +2078,7 @@ CHARACTERS = {
         "win_dialogue": "Jeet? Jeet toh wahi karta hai jiske paase uske niyam likhe hon.",
         "lose_dialogue": "Ek chaal bigad gayi… par Shakuni ki sharti kabhi khatam nahi hoti.",
         "special_dialogue": "MAYA JAAL! Jhooth ka jaal, sach ka dard — idhar dekho… nahin, Udhar dekho!",
+        "low_hp_dialogue": "Chaal bigad rahi hai… par Shakuni haar mein bhi paase badal leta hai!",
         "taunt": "Tum ladai lad rahe ho, main pehle se bahut khel chuka hoon — haaro mat, seekho!",
         "description": "Master strategist of Gandhara and architect of the fateful game "
                        "of dice. With loaded dice forged from his family's grief, one "
@@ -2315,23 +2379,254 @@ def draw_mini_warrior(target, rect, char_data, t=0.0):
 
 
 # =====================================================================
-# SECTION 6: GAME STATES (the state machine scenes)
+# SECTION 6A: DIALOGUE SYSTEM — typewriter boxes + queue
+# =====================================================================
+# A DialogueBox renders one dramatic line at the bottom of the screen
+# with a typewriter reveal (DIALOGUE_CHARS_PER_FRAME letters per frame),
+# a dark semi-transparent panel bordered in the SPEAKER's colour and
+# the speaker's name floating above it in that same colour.
+#
+#   * auto-dismiss after `duration` frames          (spec: 90f = 1.5 s)
+#   * skip on ANY key press -> finish the line instantly; pressing again
+#     while the box is already complete dismisses it and moves to the
+#     next queued entry
+#   * queue system: add() several entries and they play back in order
 # =====================================================================
 
-def wrap_text(text, font, max_w, max_lines=2):
-    """Greedy word-wrap helper used by dialogue banners & result lines."""
-    words, lines, cur = text.split(), [], ""
-    for w in words:
-        trial = (cur + " " + w).strip()
-        if font.size(trial)[0] <= max_w:
-            cur = trial
-        else:
-            lines.append(cur)
-            cur = w
-    if cur:
-        lines.append(cur)
-    return lines[:max_lines]
+DIALOGUE_BOX_H = 118            # panel height (px)
+DIALOGUE_BOX_MARGIN = 46        # left/right inset from the screen edges
+DIALOGUE_LINE_H = 24            # wrapped-line pitch inside the panel
+DIALOGUE_CHARS_PER_FRAME = 2    # typewriter speed: 2 characters / frame
+DIALOGUE_DEFAULT_DURATION = 90  # frames a line stays up (1.5 s @ 60 FPS)
 
+
+class DialogueBox:
+    """One typewriter dialogue entry plus its playback state."""
+
+    def __init__(self, text, speaker=None, color=None,
+                 duration=DIALOGUE_DEFAULT_DURATION):
+        self.text = str(text)
+        self.speaker = speaker or ""
+        self.color = tuple(color) if color else GOLD
+        self.duration = int(max(30, duration))
+        self.timer = 0              # frames this entry has been visible
+        self.shown = 0              # characters revealed so far (typewriter)
+        self._lines_cache = None    # wrapped lines (computed lazily)
+        self._cache_key = None
+
+    # ---------- typewriter helpers ----------
+    def wrapped_lines(self, max_w):
+        """Wrap the full text once and cache it (cheap per-frame reuse)."""
+        if self._cache_key != max_w:
+            self._lines_cache = wrap_text(self.text, FONT_SMALL, max_w,
+                                          max_lines=3)
+            self._cache_key = max_w
+        return self._lines_cache
+
+    def visible_text(self):
+        """The prefix of the line revealed by the typewriter so far."""
+        return self.text[:self.shown]
+
+    @property
+    def typing_done(self):
+        return self.shown >= len(self.text)
+
+    # ---------- playback ----------
+    def update(self):
+        """Advance one frame: reveal 2 chars/frame, then time out."""
+        self.timer += 1
+        if self.shown < len(self.text):
+            self.shown = min(len(self.text),
+                             self.shown + DIALOGUE_CHARS_PER_FRAME)
+
+    def skip_typing(self):
+        """INSTANT-SKIP: reveal the whole line immediately."""
+        self.shown = len(self.text)
+
+    @property
+    def expired(self):
+        """True once the line is fully shown AND held for its duration."""
+        return self.typing_done and self.timer >= self.duration
+
+    def draw(self, target, y=None):
+        """Dark semi-transparent panel, coloured border + speaker tag."""
+        inner_w = SCREEN_WIDTH - DIALOGUE_BOX_MARGIN * 2 - 28
+        lines = self.wrapped_lines(inner_w)
+        h = DIALOGUE_BOX_H
+        y = SCREEN_HEIGHT - h - 26 if y is None else y
+        x = DIALOGUE_BOX_MARGIN
+
+        panel = pygame.Surface((SCREEN_WIDTH - DIALOGUE_BOX_MARGIN * 2, h),
+                               pygame.SRCALPHA)
+        panel.fill((10, 5, 16, 225))                    # dark translucent
+        pygame.draw.rect(panel, (*self.color, 255),
+                         panel.get_rect(), 3, border_radius=12)
+        # inner hairline for a gilded look
+        pygame.draw.rect(panel, (*self.color, 90),
+                         panel.get_rect().inflate(-10, -10), 1,
+                         border_radius=10)
+        target.blit(panel, (x, y))
+
+        # ---- speaker name plate ABOVE the box, in the speaker's colour --
+        if self.speaker:
+            name_img = FONT_SMALL.render(self.speaker, True, self.color)
+            nw = name_img.get_width() + 22
+            plate = pygame.Surface((nw, 26), pygame.SRCALPHA)
+            plate.fill((10, 5, 16, 235))
+            pygame.draw.rect(plate, (*self.color, 255),
+                             plate.get_rect(), 2, border_radius=8)
+            target.blit(plate, (x + 14, y - 30))
+            target.blit(name_img, (x + 25, y - 28))
+
+        # ---- typewriter text (partial until fully revealed) ------------
+        txt = self.visible_text()
+        yy = y + 22
+        partial_line = None
+        remaining = len(txt)
+        for i, ln in enumerate(lines):
+            take = min(len(ln), max(0, remaining))
+            shown_part = ln[:take]
+            remaining -= len(ln) + 1          # +1 ~ the dropped space
+            if shown_part:
+                img = FONT_SMALL.render(shown_part, True, WHITE)
+                target.blit(img, (x + 16, yy))
+            if take < len(ln):
+                partial_line = i
+                break
+            yy += DIALOGUE_LINE_H
+        # ---- blinking caret while the typewriter is still running -----
+        if not self.typing_done:
+            idx = partial_line if partial_line is not None else 0
+            shown_here = remaining_before = None      # readability only
+            cur_text = ""
+            if idx < len(lines):
+                used = sum(len(l) + 1 for l in lines[:idx])
+                cur_text = lines[idx][:max(0, len(txt) - used)]
+            cxc = x + 16 + FONT_SMALL.size(cur_text)[0]
+            cyc = y + 22 + DIALOGUE_LINE_H * idx
+            if blink_visible(self.timer * 16.6, period_ms=520, duty=0.6):
+                pygame.draw.rect(target, self.color, (cxc + 2, cyc + 2, 3, 20))
+
+
+class DialogueQueue:
+    """Sequential playback of several DialogueBox entries."""
+
+    def __init__(self):
+        self.entries = []       # list[DialogueBox]
+        self.current = None
+
+    # ---------- API ----------
+    def add(self, text, speaker=None, color=None,
+            duration=DIALOGUE_DEFAULT_DURATION):
+        self.entries.append(DialogueBox(text, speaker, color, duration))
+
+    def extend(self, pairs, speaker=None, color=None,
+               duration=DIALOGUE_DEFAULT_DURATION):
+        """Queue many lines at once (e.g. both intro_dialogue lines)."""
+        for t in pairs:
+            self.add(t, speaker, color, duration)
+
+    def clear(self):
+        self.entries.clear()
+        self.current = None
+
+    @property
+    def active(self):
+        return self.current is not None
+
+    @property
+    def empty(self):
+        return not self.entries and self.current is None
+
+    def _promote(self):
+        """Move the next queued entry into the current slot."""
+        if self.entries:
+            self.current = self.entries.pop(0)
+        else:
+            self.current = None
+
+    # ---------- playback ----------
+    def update(self):
+        if self.current is None:
+            self._promote()
+        if self.current is not None:
+            self.current.update()
+            if self.current.expired:
+                self.current = None
+                self._promote()
+
+    def handle_key(self):
+        """ANY key press: first finishes the typewriter, second skips."""
+        if self.current is None:
+            self._promote()
+            return True
+        if not self.current.typing_done:
+            self.current.skip_typing()
+        else:
+            self.current = None
+            self._promote()
+        return True
+
+    def draw(self, target, y=None):
+        if self.current is not None:
+            self.current.draw(target, y)
+
+
+# =====================================================================
+# SECTION 6B: CINEMATIC PRE-FIGHT INTRO
+# =====================================================================
+# Timeline (frames @ 60 FPS) — every step keeps the fighters frozen:
+#   0..INTRO_FADE_IN          black screen fades in over the arena
+#   P1 spotlight + 2 intro lines (90 frames each, slow zoom-in)
+#   camera SWISH
+#   P2 spotlight + 2 intro lines (90 frames each, slow zoom-in)
+#   VS screen: both warriors facing each other, huge gold "VS"
+#   "YUDDH AARAMBH!" (Battle Begin!) Sanskrit-style gold flourish
+# ---------------------------------------------------------------------
+INTRO_FADE_IN = 20
+INTRO_SPOT_FRAMES = 18          # light beam sweeps onto the hero
+INTRO_LINE_FRAMES = 90          # each intro_dialogue line = 90 frames
+INTRO_SWISH_FRAMES = 22         # camera switch between the two heroes
+INTRO_VS_FRAMES = 70            # VS standoff
+INTRO_BEGIN_FRAMES = 55         # "YUDDH AARAMBH!" flourish
+
+INTRO_ZOOM_MIN = 0.82           # slow zoom effect range (scale factor)
+INTRO_ZOOM_MAX = 1.12
+INTRO_SPOT_RADIUS = 132         # spotlight disc radius around a fighter
+
+
+def _intro_zoom(frac):
+    """Slow cinematic push-in: scale grows linearly across the segment."""
+    return INTRO_ZOOM_MIN + (INTRO_ZOOM_MAX - INTRO_ZOOM_MIN) * frac
+
+
+def draw_spotlight(target, cx, foot_y, radius, tint=(255, 220, 150)):
+    """Cinematic stage light: dim everything, then punch a bright cone
+    and floor ellipse around (cx, foot_y).  Pure alpha surfaces."""
+    # 1) darken the whole frame
+    dim = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+    dim.fill((0, 0, 0, 205))
+    target.blit(dim, (0, 0))
+    # 2) cut the lit pool back out of the darkness
+    pool = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+    for rr, aa in ((radius, 60), (int(radius * 0.72), 95),
+                   (int(radius * 0.45), 150)):
+        pygame.draw.circle(pool, (*tint, aa), (radius, radius), rr)
+    target.blit(pool, (int(cx) - radius, int(foot_y - 80) - radius))
+    # 3) light cone from above + glowing floor ellipse
+    cone = pygame.Surface((radius * 2, 300), pygame.SRCALPHA)
+    pygame.draw.polygon(cone, (*tint, 46),
+                        [(radius - 16, 0), (radius + 16, 0),
+                         (radius * 2, 300), (0, 300)])
+    target.blit(cone, (int(cx) - radius, int(foot_y) - 300))
+    ell = pygame.Surface((radius * 2, 40), pygame.SRCALPHA)
+    pygame.draw.ellipse(ell, (*tint, 70), (0, 0, radius * 2, 40))
+    target.blit(ell, (int(cx) - radius, int(foot_y) - 20))
+
+
+# =====================================================================
+# SECTION 6: GAME STATES (the state machine scenes)
+# =====================================================================
 
 class GameState:
     """Base class for one scene of the state machine."""
@@ -2791,10 +3086,12 @@ class FightState(GameState):
     """Real-time combat between the two selected fighters.
 
     All stats, weapons and dialogues come from the CHARACTERS database:
-      intro_dialogue  -> shown during the "FIGHT!" banner
-      special_dialogue-> shouted when the astral weapon is unleashed
-      taunt           -> occasional mid-fight shout-outs
-      win/lose_dialogue -> handed to the result screen
+      intro_dialogue   -> cinematic pre-fight spotlight scene (Round 1)
+      low_hp_dialogue  -> desperate cry when HP falls below 30%
+      special_dialogue -> typewriter box when an astra is unleashed
+      taunt            -> shouted when a combo reaches 5 hits (+idle barks)
+      win_dialogue     -> typewriter box as the round is won
+      lose_dialogue    -> typewriter box on the RESULT screen
     """
     name = STATE_FIGHT
 
@@ -2848,14 +3145,294 @@ class FightState(GameState):
         self.lightning_bolts = []        # [(points, color, ttl), ...]
         for f in (self.f1, self.f2):     # wire the shared fx into fighters
             f.fx = self.fx
-        # dramatic pre-fight exchange (2 intro lines from the database)
-        intro = (p1_data["intro_dialogue"][0] + "   ||   " +
-                 p2_data["intro_dialogue"][0])
-        self.set_banner(intro, SAFFRON, 4500)
+
+        # ============ DIALOGUE AND CINEMATIC INTRO SYSTEM =============
+        # Three independent queues: the long pre-fight cinematic, the
+        # short mid-fight shouts (specials) and the round-end speeches.
+        self.dialogues = DialogueQueue()
+        self.intro_dialogues = DialogueQueue()
+        self.end_dialogues = DialogueQueue()
+        self.intro_playing = False          # cinematic owns the screen?
+        self.intro_frame = 0                # frames elapsed in the segment
+        self.intro_segment = ""             # FADE/P1_SPOT/SWISH/P2_SPOT/VS/BEGIN
+        self.intro_zoom = 1.0               # slow zoom factor this segment
+        self._intro_build(p1_data, p2_data)
+        self._intro_start("FADE")
+        self.banner = None                  # legacy ribbon not used for intro
 
     # ---------- helpers ----------
     def set_banner(self, text, color=WHITE, ms=2800):
         self.banner = (text, color, pygame.time.get_ticks() + ms)
+
+    def say(self, text, speaker=None, color=None,
+            duration=DIALOGUE_DEFAULT_DURATION):
+        """DIALOGUE SYSTEM entry point — queue one typewriter line."""
+        self.dialogues.add(text, speaker=speaker or "",
+                           color=color or GOLD, duration=duration)
+
+    # ==================================================================
+    # CINEMATIC PRE-FIGHT INTRO (plays once, before Round 1)
+    #   FADE -> P1_SPOT (2 lines) -> SWISH -> P2_SPOT (2 lines)
+    #        -> VS standoff -> "YUDDH AARAMBH!" -> live combat
+    # Each spotlight shot animates a slow zoom by scaling the fighter.
+    # ==================================================================
+    INTRO_ORDER = ("P1_SPOT", "SWISH", "P2_SPOT", "SWISH",
+                   "VS", "BEGIN")
+
+    def _intro_build(self, p1_data, p2_data):
+        """Queue both intro_dialogue lines for P1, then for P2."""
+        q = self.intro_dialogues
+        q.clear()
+        for line in list(p1_data.get("intro_dialogue", []))[:2]:
+            q.add(line, speaker=p1_data.get("name", "P1"),
+                  color=p1_data.get("color", SAFFRON),
+                  duration=INTRO_LINE_FRAMES)
+        for line in list(p2_data.get("intro_dialogue", []))[:2]:
+            q.add(line, speaker=p2_data.get("name", "P2"),
+                  color=p2_data.get("color", DARK_BLUE),
+                  duration=INTRO_LINE_FRAMES)
+
+    def _intro_start(self, segment):
+        """Jump the cinematic to a new beat and reset its frame clock."""
+        self.intro_segment = segment
+        self.intro_frame = 0
+        if segment == "FADE":
+            self.intro_playing = True
+            for f in (self.f1, self.f2):
+                f.intro_lock = True           # nobody moves during the film
+                f.draw_scale = 1.0
+        elif segment == "P1_SPOT":
+            self.f2.x = 940.0                 # push the foe out of the shot
+            self.f1.facing = 1
+            self.f1.state = "idle"
+        elif segment == "P2_SPOT":
+            self.f1.x = 260.0
+            self.f2.facing = -1
+            self.f2.state = "idle"
+        elif segment == "VS":
+            self.f1.x = 300.0
+            self.f2.x = 900.0
+            self.f1.facing, self.f2.facing = 1, -1
+            self.fx.shake(10, 5)              # the clash shakes the lens
+            self.fx.flash(FLASH_FRAMES + 1)
+        elif segment == "BEGIN":
+            self.fx.shake(8, 4)
+        elif segment == "DONE":
+            self.intro_playing = False
+            for f in (self.f1, self.f2):
+                f.intro_lock = False
+                f.draw_scale = 1.0
+            self.round_start = pygame.time.get_ticks()   # start the 99 s clock
+            self.taunt_at = self.round_start + random.randint(9000, 14000)
+            self.set_banner("ROUND 1  —  YUDDH AARAMBH!", SAFFRON, 1600)
+
+    def _intro_segment_len(self, segment):
+        """Frames this beat runs when no dialogue is attached to it."""
+        if segment == "FADE":
+            return INTRO_FADE_IN
+        if segment == "SWISH":
+            return INTRO_SWISH_FRAMES
+        if segment in ("P1_SPOT", "P2_SPOT"):
+            return max(INTRO_SPOT_FRAMES,
+                       len(self.intro_dialogues.entries) *
+                       INTRO_LINE_FRAMES)
+        if segment == "VS":
+            return INTRO_VS_FRAMES
+        if segment == "BEGIN":
+            return INTRO_BEGIN_FRAMES
+        return 10
+
+    def _intro_next(self):
+        seq = list(self.INTRO_ORDER)
+        try:
+            i = seq.index(self.intro_segment)
+        except ValueError:
+            i = -1
+        if i + 1 < len(seq):
+            self._intro_start(seq[i + 1])
+        else:
+            self._intro_start("DONE")
+
+    def _update_intro(self):
+        """Advance the cinematic one frame (also drains fx request queues)."""
+        self.intro_frame += 1
+        seg = self.intro_segment
+        if seg in ("P1_SPOT", "P2_SPOT"):
+            self.intro_dialogues.update()
+            held = self.intro_dialogues.active
+            span = self._intro_segment_len(seg)
+            frac = min(1.0, self.intro_frame / max(1, span))
+            self.intro_zoom = _intro_zoom(frac)
+            hero = self.f1 if seg == "P1_SPOT" else self.f2
+            hero.draw_scale = self.intro_zoom
+            if held:
+                self.intro_frame = min(self.intro_frame, span - 1)
+            elif self.intro_frame >= span:
+                self.intro_dialogues.clear()
+                self._intro_next()
+        else:
+            self.intro_zoom = 1.0
+            self.f1.draw_scale = 1.0
+            self.f2.draw_scale = 1.0
+            if self.intro_frame >= self._intro_segment_len(seg):
+                self._intro_next()
+        # particles / camera requests still tick while the film plays
+        self.fx.update()
+        self._drain_fx_requests()
+        if self.hit_freeze_frames > 0:
+            self.hit_freeze_frames -= 1
+        if self.flash_frames > 0:
+            self.flash_frames -= 1
+        if self.tint_frames > 0:
+            self.tint_frames -= 1
+        if self.shake_frames > 0:
+            self.shake_frames -= 1
+
+    def _draw_intro(self, world_target):
+        """Render whichever beat of the film is currently playing."""
+        seg = self.intro_segment
+        if seg == "FADE":
+            k = self.intro_frame / max(1, INTRO_FADE_IN)
+            veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT),
+                                  pygame.SRCALPHA)
+            veil.fill((0, 0, 0, int(255 * max(0.0, 1.0 - k))))
+            world_target.blit(veil, (0, 0))
+            draw_centered_text(world_target, "KURUKSHETRA", FONT_MEDIUM,
+                               GREY, SCREEN_WIDTH // 2, 60)
+            return
+        if seg == "SWISH":
+            self._draw_spot_shot(world_target, None)
+            k = self.intro_frame / max(1, INTRO_SWISH_FRAMES)
+            band = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT),
+                                  pygame.SRCALPHA)
+            band.fill((0, 0, 0, 255))
+            gap_h = int(SCREEN_HEIGHT * (1.0 - abs(k - 0.5) * 2.0))
+            pygame.Rect(0, 0, SCREEN_WIDTH, 0)
+            cut = int(SCREEN_HEIGHT // 2 - gap_h // 2)
+            pygame.draw.rect(band, (0, 0, 0, 255), (0, 0, SCREEN_WIDTH, cut))
+            pygame.draw.rect(band, (0, 0, 0, 255),
+                             (0, cut + gap_h, SCREEN_WIDTH,
+                              SCREEN_HEIGHT - cut - gap_h))
+            world_target.blit(band, (0, 0))
+            return
+        if seg in ("P1_SPOT", "P2_SPOT"):
+            self._draw_spot_shot(world_target, seg)
+            return
+        if seg == "VS":
+            self._draw_vs_screen(world_target)
+            return
+        if seg == "BEGIN":
+            self._draw_begin_screen(world_target)
+            return
+
+    def _spot_focus(self, seg):
+        """Which warrior owns the current spotlight shot ('' for none)."""
+        if seg == "P1_SPOT":
+            return self.f1
+        if seg == "P2_SPOT":
+            return self.f2
+        return None
+
+    def _draw_spot_shot(self, world_target, seg):
+        """Black stage + spotlight cone on ONE fighter + his dialogue box."""
+        hero = self._spot_focus(seg)
+        # black backdrop first so nothing of the arena leaks through
+        bg = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        bg.fill((2, 1, 6, 255))
+        world_target.blit(bg, (0, 0))
+        # faint dharma chakra watermark behind the hero
+        if hero is not None:
+            draw_dharma_chakra(world_target, int(hero.x), 200, 150,
+                               hero.special_color, spokes=16,
+                               angle_offset=self.intro_frame * 0.01,
+                               width=2, alpha=45)
+            foot_y = int(GROUND_Y - hero.y)
+            radius = int(INTRO_SPOT_RADIUS *
+                         (0.75 + 0.25 * min(1.0, self.intro_frame /
+                                           max(1, INTRO_SPOT_FRAMES))))
+            draw_spotlight(world_target, hero.x, foot_y, radius,
+                           tint=tuple(min(255, c + 90)
+                                      for c in hero.color))
+            hero.draw(world_target)
+            # speaker stripe so the eye knows who is talking
+            name_col = hero.color if hero.color != WHITE else GOLD
+            draw_centered_text(world_target, hero.name, FONT_LARGE,
+                               name_col, SCREEN_WIDTH // 2, 78, shadow=True)
+            epithet = hero.data.get("epithet", "")
+            if epithet:
+                draw_centered_text(world_target, epithet, FONT_SMALL,
+                                   GREY, SCREEN_WIDTH // 2, 118)
+        else:                                       # swish: pure darkness
+            veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT),
+                                  pygame.SRCALPHA)
+            veil.fill((0, 0, 0, 235))
+            world_target.blit(veil, (0, 0))
+        self.intro_dialogues.draw(world_target)
+        # skip hint
+        draw_centered_text(world_target, "koi bhi key: dialogue skip",
+                           FONT_TINY, GREY, SCREEN_WIDTH - 120,
+                           SCREEN_HEIGHT - 22)
+
+    def _draw_vs_screen(self, world_target):
+        """Dramatic VS standoff: both warriors facing each other."""
+        self.game.background.draw(world_target)
+        veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        veil.fill((6, 3, 12, 200))
+        world_target.blit(veil, (0, 0))
+        # radial speed-lines bursting from the centre
+        cx, cy = SCREEN_WIDTH // 2, 250
+        for i in range(20):
+            a = i * math.tau / 20 + self.intro_frame * 0.03
+            r0 = 120 + (self.intro_frame * 3 % 60)
+            pygame.draw.line(world_target, (*SAFFRON, ),
+                             (cx + math.cos(a) * r0, cy + math.sin(a) * r0),
+                             (cx + math.cos(a) * (r0 + 70),
+                              cy + math.sin(a) * (r0 + 70)), 2)
+        self.f1.draw(world_target)
+        self.f2.draw(world_target)
+        # huge gold VS slamming together
+        k = min(1.0, self.intro_frame / max(1, INTRO_VS_FRAMES * 0.45))
+        size = int(60 + 90 * k)
+        vs_font = pygame.font.SysFont("arial", max(30, size), bold=True)
+        left = self.f1.name + "  "
+        right = "  " + self.f2.name
+        draw_centered_text(world_target, left + "VS" + right, FONT_MEDIUM,
+                           WHITE, cx, 150, shadow=True)
+        img = vs_font.render("VS", True, GOLD)
+        img = pygame.transform.rotate(img, -8 + 8 * k)
+        world_target.blit(img, img.get_rect(center=(cx, 250)))
+        sh = vs_font.render("VS", True, DEEP_RED)
+        world_target.blit(sh, sh.get_rect(center=(cx + 5, 255)))
+        draw_centered_text(world_target, "DHARMA YUDDH", FONT_SMALL,
+                           SAFFRON, cx, 330, shadow=True)
+
+    def _draw_begin_screen(self, world_target):
+        """"YUDDH AARAMBH!" (Battle Begin!) in Sanskrit-style gold."""
+        self.game.background.draw(world_target)
+        veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        veil.fill((0, 0, 0, 150))
+        world_target.blit(veil, (0, 0))
+        self.f1.draw(world_target)
+        self.f2.draw(world_target)
+        cx, cy = SCREEN_WIDTH // 2, 250
+        k = min(1.0, self.intro_frame / max(1, INTRO_BEGIN_FRAMES * 0.5))
+        pulse = 1.0 + 0.06 * math.sin(self.intro_frame * 0.35)
+        big = pygame.font.SysFont("arial", max(30, int(64 * k * pulse)),
+                                  bold=True)
+        # Devanagari flourish + romanised transliteration
+        draw_centered_text(world_target, "युद्ध आरम्भ!", FONT_MEDIUM,
+                           SAFFRON, cx, cy - 58, shadow=True)
+        draw_centered_text(world_target, "YUDDH AARAMBH!", big, GOLD,
+                           cx, cy, shadow=True)
+        draw_centered_text(world_target, "— BATTLE BEGIN! —", FONT_SMALL,
+                           WHITE, cx, cy + 52, shadow=True)
+        # gold rule lines sweeping outward
+        half = int(300 * k)
+        pygame.draw.line(world_target, GOLD, (cx - half, cy + 26),
+                         (cx - 40, cy + 26), 3)
+        pygame.draw.line(world_target, GOLD, (cx + 40, cy + 26),
+                         (cx + half, cy + 26), 3)
+        pygame.draw.circle(world_target, GOLD, (cx, cy + 26), 5)
 
     def _special_attempt(self, f):
         """Try to fire the astral weapon; on success shout the dialogue.
