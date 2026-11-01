@@ -64,6 +64,7 @@ GOLD      = (255, 215, 0)     # shimmering gold
 DEEP_RED  = (139, 0, 0)       # deep battle red
 DARK_BLUE = (10, 10, 45)      # dark twilight blue
 GREEN     = (34, 139, 34)     # forest green
+YELLOW    = (255, 210, 0)     # health-bar mid tier
 WHITE     = (255, 255, 255)
 BLACK     = (0, 0, 0)
 GREY      = (128, 128, 128)
@@ -2372,7 +2373,23 @@ class FightState(GameState):
         self.f2 = Fighter(p2_data, 900, 0, facing=-1, is_player2=True,
                           controls=P2_KEYS)
         self.round_start = pygame.time.get_ticks()
-        self.winner = None
+        # spawn records so rounds can be reset with pristine fighters
+        self.spawn_data = [
+            {"data": p1_data, "x": 300},
+            {"data": p2_data, "x": 900},
+        ]
+        # ---- PROFESSIONAL HUD state ---------------------------------
+        # Best-of-3 round system: first fighter to 2 round wins takes the
+        # match; on timeout the higher-HP fighter wins the round.
+        self.round_number = 1
+        self.round_wins = {self.f1: 0, self.f2: 0}
+        self.match_over = False
+        self.hud_freeze = False          # input lock during intro/announcer
+        self.timer_left = 99.0           # 99-second countdown (HUD timer)
+        # Smooth health-drain animation: display_health eases toward health
+        for f in (self.f1, self.f2):
+            f.display_health = float(f.health)
+        self.winner = None               # round winner (None = still fighting)
         self.end_delay_until = None
         self.hit_sparks = []          # (x, y, frames_left, color)
         self.banner = None            # (text, colour, expires_ms)
@@ -2418,7 +2435,7 @@ class FightState(GameState):
         if event.key == pygame.K_ESCAPE:
             self.game.change_state(STATE_MENU)
             return
-        if self.winner:
+        if self.hud_freeze or self.winner:
             return
         k = event.key
         # ---------------- PLAYER 1 : Arrow keys + Z (punch) X (kick) ------
@@ -2455,7 +2472,7 @@ class FightState(GameState):
         "Back" simply means the arrow pointing away from the opponent,
         which is the classic fighting-game guard input."""
         pressed = pygame.key.get_pressed()
-        if self.winner:
+        if self.hud_freeze or self.winner:
             return
         now_ms = pygame.time.get_ticks()
 
@@ -2613,31 +2630,54 @@ class FightState(GameState):
                     self.hit_sparks.append((x, y, t, c))
                 f._pending_fx_sparks.clear()
 
-    def update(self, dt):
+    def update(self, dt_ms):
+        # The main loop hands every state the frame time in MILLISECONDS
+        # (clock.tick returns ms); the fight timer works in seconds.
+        dt = dt_ms / 1000.0
         now = pygame.time.get_ticks()
         self.fight_frame += 1          # master frame clock (60 FPS)
-        if not self.winner:
-            self._process_movement()
+        intro_left = (now - self.round_start) < 1400
+        self.hud_freeze = bool(self.winner) or intro_left
+        if not self.hud_freeze:
+            # ---- TIMER: 99-second countdown, only while the fight is live
+            self.timer_left -= dt
+            if self.timer_left <= 0:
+                self.timer_left = 0.0
+                # time-up: the warrior with more HP takes the round
+                w = self.f1 if self.f1.health >= self.f2.health \
+                    else self.f2
+                l = self.f2 if w is self.f1 else self.f1
+                self._end_round(w, timeout=True)
+            else:
+                self._process_movement()
+                self.f1.update(self.f2)
+                self.f2.update(self.f1)
+                self._resolve_hits()
+                # ---- SPECIAL MOVES SYSTEM pipeline ----
+                self._update_astra_projectiles()   # fly astras + spawn trails
+                self._resolve_projectiles()        # astra <-> body collisions
+                self._resolve_vortex()             # CHAKRAVYUHA BREAKER ring
+                self._drain_fx_requests()          # shake/sparks queued by fx
+                # occasional taunts straight out of the character database
+                if now >= self.taunt_at:
+                    self.taunt_at = now + random.randint(9000, 14000)
+                    shouter = random.choice((self.f1, self.f2))
+                    self.set_banner(shouter.data["taunt"], GREY, 2400)
+                if self.f1.health <= 0 or self.f2.health <= 0:
+                    self._end_round(
+                        self.f1 if self.f1.health > 0 else self.f2)
+        elif self.winner:
+            # KO/timeout pose: physics keep running so bodies settle
             self.f1.update(self.f2)
             self.f2.update(self.f1)
-            self._resolve_hits()
-            # ---- SPECIAL MOVES SYSTEM pipeline ----
-            self._update_astra_projectiles()   # fly astras + spawn trails
-            self._resolve_projectiles()        # astra <-> body collisions
-            self._resolve_vortex()             # CHAKRAVYUHA BREAKER ring
-            self._drain_fx_requests()          # shake/sparks queued by fx
-            # occasional taunts straight out of the character database
-            if now >= self.taunt_at:
-                self.taunt_at = now + random.randint(9000, 14000)
-                shouter = random.choice((self.f1, self.f2))
-                self.set_banner(shouter.data["taunt"], GREY, 2400)
-            if self.f1.health <= 0 or self.f2.health <= 0:
-                self.winner = self.f1 if self.f1.health > 0 else self.f2
-                loser = self.f2 if self.winner is self.f1 else self.f1
-                self.game.result_win_line = self.winner.data["win_dialogue"]
-                self.game.result_lose_line = loser.data["lose_dialogue"]
-                self.set_banner(self.winner.data["win_dialogue"], GOLD, 3000)
-                self.end_delay_until = now + 2600
+            self._drain_fx_requests()
+        # ---- HUD smooth health drain (display eases toward real HP) ----
+        for f in (self.f1, self.f2):
+            diff = f.health - f.display_health
+            if abs(diff) < 0.25:
+                f.display_health = float(f.health)
+            else:
+                f.display_health += diff * 0.12
         if self.banner and now > self.banner[2]:
             self.banner = None
         self.fx.update()               # advance every particle this frame
@@ -2650,8 +2690,66 @@ class FightState(GameState):
         self.combo_pops = [(f, txt, t - 1) for f, txt, t in self.combo_pops
                            if t > 1]
         if self.winner and now >= self.end_delay_until:
-            self.game.result_winner = self.winner.name
-            self.game.change_state(STATE_RESULT)
+            if self.match_over:
+                self.game.result_winner = self.winner.name
+                self.game.change_state(STATE_RESULT)
+            else:
+                self._begin_next_round()
+
+    # ------------------------------------------------------------------
+    # PROFESSIONAL HUD — round management helpers
+    # ------------------------------------------------------------------
+    def _end_round(self, w, timeout=False):
+        """Finish the current round: credit the win, shout a banner and
+        schedule either the next round reset or the RESULT screen."""
+        self.winner = w
+        loser = self.f2 if w is self.f1 else self.f1
+        self.round_wins[w] += 1
+        self.game.result_win_line = w.data["win_dialogue"]
+        self.game.result_lose_line = loser.data["lose_dialogue"]
+        if timeout:
+            self.set_banner("TIME UP!  " + w.name +
+                            " takes the round on health!", GOLD, 2400)
+        else:
+            self.set_banner(w.data["win_dialogue"], GOLD, 3000)
+        self.end_delay_until = pygame.time.get_ticks() + 2600
+        # best of 3: two round wins ends the match
+        if self.round_wins[w] >= 2:
+            self.match_over = True
+
+    def _reset_fighter(self, f, facing):
+        """Put one fighter back to its starting stance for a new round.
+
+        Rebuilds a completely fresh Fighter (so every attack / stun /
+        astral-effect timer starts clean) using the stored char record,
+        spawn x and keymap, then re-seeds the HUD's smooth-drain value."""
+        slot = 0 if not f.is_player2 else 1
+        fresh = Fighter(self.spawn_data[slot]["data"],
+                        self.spawn_data[slot]["x"], 0,
+                        facing=facing, is_player2=f.is_player2,
+                        controls=f.controls)
+        # swap the live fighter's whole state with the fresh instance
+        f.__dict__.clear()
+        f.__dict__.update(fresh.__dict__)
+        f.display_health = float(f.health)
+
+    def _begin_next_round(self):
+        """Round interlude ended — restore both warriors and tick the
+        round counter / countdown timer."""
+        self.round_number += 1
+        self.timer_left = 99.0
+        self.winner = None
+        self.end_delay_until = None
+        self.hit_sparks.clear()
+        self.combo_pops.clear()
+        self.fx.particles.clear()
+        self.shake_frames = 0
+        self.shake_intensity = 0
+        self._reset_fighter(self.f1, 1)
+        self._reset_fighter(self.f2, -1)
+        self.round_start = pygame.time.get_ticks()
+        self.taunt_at = self.round_start + random.randint(6000, 9000)
+        self.set_banner(f"ROUND {self.round_number}", SAFFRON, 1300)
 
     def draw(self, world_target):
         """Render the whole fight onto an off-screen canvas, then blit it
@@ -2693,13 +2791,15 @@ class FightState(GameState):
         screen.blit(world_target, (int(ox), int(oy)))
 
         # ---------- HUD is rock-steady above the shaking world ----------
-        self._draw_hud(world_target)     # (kept for combo pop reference)
         self._draw_hud(screen)
         self._draw_banner(screen)
 
         # "FIGHT!" announcement for the first 1.4 s of every bout
         elapsed = pygame.time.get_ticks() - self.round_start
         if elapsed < 1400:
+            if elapsed > 950:   # announcer punch-in right before controls
+                draw_centered_text(screen, "FIGHT!", FONT_LARGE, GOLD,
+                                   SCREEN_WIDTH // 2, 250, shadow=True)
             grow = 1.0 + 0.25 * math.sin(elapsed * 0.02)
             fsz = max(30, int(90 * grow))
             draw_centered_text(screen, "FIGHT!",
@@ -2881,7 +2981,10 @@ class FightState(GameState):
             sh.set_alpha(alpha)
             x = int(max(10, min(SCREEN_WIDTH - img.get_width() - 10,
                                 f.x - img.get_width() // 2)))
-            y = int(GROUND_Y - f.y - STAND_HEIGHT - 78)
+            # slight BOUNCE: pops rise then settle as they fade
+            t01 = frames_left / 70.0
+            bounce = abs(math.sin(t01 * math.pi * 2.2)) * 10.0 * t01
+            y = int(GROUND_Y - f.y - STAND_HEIGHT - 78 - bounce)
             outline = img.copy()
             outline.set_alpha(min(alpha, 140))
             target.blit(outline, (x + 2, y + 2))
@@ -2907,62 +3010,185 @@ class FightState(GameState):
                                SCREEN_WIDTH // 2, y)
             y += 22
 
+    # ------------------------------------------------------------------
+    # PROFESSIONAL HUD (Heads-Up Display)
+    #   * 400x30 health bars, P1 left-anchored / P2 mirrored right
+    #   * green -> yellow -> red tiers, smooth drain animation
+    #   * 200x12 special meters that pulse when DIVINE POWER is ready
+    #   * 99-second countdown in a gold-framed plate (red under 10 s)
+    #   * ROUND indicator + filled/empty round-win pips
+    #   * bouncing "X HIT COMBO!" pop-ups (see _draw_combo_pops)
+    # ------------------------------------------------------------------
+    def _health_tier_color(self, ratio):
+        """Green above 50%, yellow between 25-50%, deep red below 25%."""
+        if ratio > 0.50:
+            return GREEN
+        if ratio > 0.25:
+            return YELLOW
+        return DEEP_RED
+
+    def _draw_health_bar(self, target, f, x, y, align_left):
+        """One professional health bar: name tag above, 400x30 frame,
+        smooth draining fill, colour tiers and 'HP/max' numbers inside."""
+        bar_w, bar_h = 400, 30
+        # ---- character name above the bar, in the fighter's own colour --
+        name_img = FONT_SMALL.render(
+            ("P1  " if not f.is_player2 else "") + f.name, True,
+            f.color if f.color != WHITE else GOLD)
+        if align_left:
+            target.blit(name_img, (x, y - 26))
+        else:
+            target.blit(name_img, (x + bar_w - name_img.get_width(),
+                                   y - 26))
+        # ---- dark frame + inner well ------------------------------------
+        pygame.draw.rect(target, BLACK, (x - 3, y - 3, bar_w + 6,
+                                         bar_h + 6), border_radius=7)
+        pygame.draw.rect(target, (45, 18, 18), (x, y, bar_w, bar_h),
+                         border_radius=5)
+        # ---- SMOOTH DRAIN: white "damage ghost" eases toward real HP ----
+        disp_ratio = max(0.0, f.display_health / f.max_health)
+        real_ratio = max(0.0, f.health / f.max_health)
+        ghost_w = int(bar_w * disp_ratio)
+        if ghost_w > 0:
+            gcol = (255, 235, 200)   # pale 'damage ghost'
+            if align_left:
+                pygame.draw.rect(target, gcol, (x, y, ghost_w, bar_h),
+                                 border_radius=5)
+            else:
+                pygame.draw.rect(target, gcol,
+                                 (x + bar_w - ghost_w, y, ghost_w, bar_h),
+                                 border_radius=5)
+        # ---- coloured fill (green/yellow/red tiers) ----------------------
+        fill_w = int(bar_w * real_ratio)
+        col = self._health_tier_color(real_ratio)
+        if fill_w > 0:
+            if align_left:
+                pygame.draw.rect(target, col, (x, y, fill_w, bar_h),
+                                 border_radius=5)
+            else:
+                pygame.draw.rect(target, col,
+                                 (x + bar_w - fill_w, y, fill_w, bar_h),
+                                 border_radius=5)
+            # glossy highlight strip on the live fill
+            hl = pygame.Surface((fill_w, 8), pygame.SRCALPHA)
+            hl.fill((255, 255, 255, 55))
+            hx = x if align_left else x + bar_w - fill_w
+            target.blit(hl, (hx, y + 3))
+        # ---- crisp gold border ------------------------------------------
+        pygame.draw.rect(target, GOLD, (x, y, bar_w, bar_h), 2,
+                         border_radius=5)
+        # ---- HP numbers inside the bar ----------------------------------
+        hp_txt = f"{max(0, int(round(f.display_health)))}/{f.max_health}"
+        img = FONT_SMALL.render(hp_txt, True, WHITE)
+        ix = x + 10 if align_left else x + bar_w - img.get_width() - 10
+        target.blit(img, (ix, y + (bar_h - img.get_height()) // 2))
+
+    def _draw_special_meter(self, target, f, x, y, align_left):
+        """Thin 200x12 meter below the health bar; fills in the astral's
+        special_color and pulses gold + flashes 'DIVINE POWER READY!'."""
+        mw, mh = 200, 12
+        ratio = max(0.0, min(1.0, f.special_meter / 100.0))
+        pygame.draw.rect(target, BLACK, (x - 2, y - 2, mw + 4, mh + 4),
+                         border_radius=5)
+        pygame.draw.rect(target, (28, 28, 42), (x, y, mw, mh),
+                         border_radius=4)
+        now = pygame.time.get_ticks()
+        ready = ratio >= 1.0
+        fill_w = int(mw * ratio)
+        if ready:
+            # pulsing glow: brightness oscillates while flashing
+            pulse = 0.5 + 0.5 * math.sin(now * 0.012)
+            base = pygame.Color(GOLD)
+            col = (int(base.r * (0.6 + 0.4 * pulse)),
+                   int(base.g * (0.6 + 0.4 * pulse)),
+                   int(base.b * (0.6 + 0.4 * pulse)))
+        else:
+            col = f.special_color
+        if fill_w > 0:
+            if align_left:
+                pygame.draw.rect(target, col, (x, y, fill_w, mh),
+                                 border_radius=4)
+            else:
+                pygame.draw.rect(target, col,
+                                 (x + mw - fill_w, y, fill_w, mh),
+                                 border_radius=4)
+        pygame.draw.rect(target, GREY, (x, y, mw, mh), 1, border_radius=4)
+        label = "DIVINE POWER READY!" if ready else "ASTRA"
+        if ready and blink_visible(now, period_ms=500, duty=0.6):
+            img = FONT_TINY.render(label, True, GOLD)
+        elif ready:
+            img = FONT_TINY.render(label, True, (120, 95, 0))
+        else:
+            img = FONT_TINY.render(f"{label} {int(ratio * 100)}%",
+                                   True, f.special_color)
+        lx = x if align_left else x + mw - img.get_width()
+        target.blit(img, (lx, y + mh + 3))
+
+    def _draw_timer_frame(self, target):
+        """Big 99s countdown centred top inside a dark gold-framed plate.
+        Flashes red once fewer than 10 seconds remain."""
+        cx, cy = SCREEN_WIDTH // 2, 46
+        secs = max(0, int(math.ceil(self.timer_left)))
+        low = secs < 10 and not self.winner
+        now = pygame.time.get_ticks()
+        flash = low and blink_visible(now, period_ms=420, duty=0.5)
+        txt_col = DEEP_RED if flash else GOLD
+        plate = pygame.Rect(cx - 52, cy - 34, 104, 68)
+        pygame.draw.rect(target, BLACK, plate.inflate(8, 8),
+                         border_radius=14)
+        pygame.draw.rect(target, DARK_BLUE, plate, border_radius=12)
+        pygame.draw.rect(target, SAFFRON if not low else DEEP_RED,
+                         plate, 3, border_radius=12)
+        font = pygame.font.SysFont("arial", 44, bold=True)
+        draw_centered_text(target, str(secs), font, txt_col, cx, cy - 22)
+        draw_centered_text(target, "TIME", FONT_TINY, GREY, cx, cy + 20)
+
+    def _draw_round_indicator(self, target):
+        """"ROUND n" beneath the timer plus win pips per fighter:
+        filled circles = rounds won, empty circles = still to be claimed."""
+        cx = SCREEN_WIDTH // 2
+        label = (f"{self.winner.name} WINS ROUND {self.round_number}!"
+                 if self.winner and self.match_over else
+                 f"ROUND {self.round_number}")
+        col = GOLD if self.winner else SAFFRON
+        draw_centered_text(target, label, FONT_SMALL, col, cx, 88)
+        # pips: 2 slots each side (best of 3)
+        pip_r, gap = 7, 20
+        for f, dirx in ((self.f1, -1), (self.f2, 1)):
+            wins = self.round_wins[f]
+            base_x = cx + dirx * 66
+            for i in range(2):
+                px = base_x + dirx * i * gap
+                py = 112
+                if i < wins:
+                    pygame.draw.circle(target, GOLD, (px, py), pip_r)
+                    pygame.draw.circle(target, SAFFRON, (px, py),
+                                       pip_r, 2)
+                else:
+                    pygame.draw.circle(target, GREY, (px, py), pip_r, 2)
+
     def _draw_hud(self, target):
-        bar_w, bar_h = 420, 26
-        for f, x, align_left in ((self.f1, 40, True),
-                                 (self.f2, SCREEN_WIDTH - 40 - bar_w,
-                                  False)):
-            ratio = f.health / f.max_health
-            fill_w = int(bar_w * ratio)
-            color = GREEN if ratio > 0.5 else (
-                SAFFRON if ratio > 0.25 else DEEP_RED)
-            pygame.draw.rect(target, BLACK, (x - 3, 27, bar_w + 6,
-                               bar_h + 6), border_radius=6)
-            pygame.draw.rect(target, (60, 20, 20), (x, 30, bar_w, bar_h),
-                             border_radius=5)
-            if align_left:
-                pygame.draw.rect(target, color, (x, 30, fill_w, bar_h),
-                                 border_radius=5)
-            else:
-                pygame.draw.rect(target, color,
-                                 (x + bar_w - fill_w, 30, fill_w, bar_h),
-                                 border_radius=5)
-            # special meter under the health bar (fills the astral weapon)
-            m_ratio = f.special_meter / 100.0
-            m_fill = int(bar_w * m_ratio)
-            pygame.draw.rect(target, (30, 30, 45), (x, 58, bar_w, 8),
-                             border_radius=4)
-            ready = m_ratio >= 1.0
-            m_col = GOLD if ready else f.special_color
-            if align_left:
-                pygame.draw.rect(target, m_col, (x, 58, m_fill, 8),
-                                 border_radius=4)
-            else:
-                pygame.draw.rect(target, m_col,
-                                 (x + bar_w - m_fill, 58, m_fill, 8),
-                                 border_radius=4)
-            name_img = FONT_SMALL.render(
-                f"{f.name} [{f.weapon}]", True, WHITE)
-            tag = " ★ READY" if ready else ""
-            if tag:
-                tag_img = FONT_SMALL.render(tag, True, GOLD)
-                if blink_visible(pygame.time.get_ticks()):
-                    if align_left:
-                        target.blit(tag_img, (x + name_img.get_width() + 8,
-                                              70))
-                    else:
-                        target.blit(tag_img,
-                                    (x + bar_w - tag_img.get_width(), 70))
-            target.blit(name_img, (x, 70) if align_left else
-                        (x + bar_w - name_img.get_width(), 70))
-        # VS emblem
+        """Assemble every HUD element — bars, meters, timer, rounds,
+        control hints.  Combo pop-ups render in the shaking world layer
+        so they stay glued to their fighter."""
+        # P1 (left, fills left->right) and P2 (right, mirrored)
+        self._draw_health_bar(target, self.f1, 40, 34, align_left=True)
+        self._draw_health_bar(target, self.f2,
+                              SCREEN_WIDTH - 40 - 400, 34, align_left=False)
+        self._draw_special_meter(target, self.f1, 40, 72, align_left=True)
+        self._draw_special_meter(target, self.f2,
+                                 SCREEN_WIDTH - 40 - 200, 72,
+                                 align_left=False)
+        self._draw_timer_frame(target)
+        self._draw_round_indicator(target)
+        # VS emblem between the bars
         draw_centered_text(target, "VS", FONT_MEDIUM, GOLD,
-                           SCREEN_WIDTH // 2, 42, shadow=True)
+                           SCREEN_WIDTH // 2, 130, shadow=True)
         # control reminder
         draw_centered_text(
             target,
-            "P1: ←/→ move  ↑ jump  ↓+← crouch/block  Z punch  X kick  CTRL special"
-            "   ·   P2: J/L move  I jump  K+J crouch/block  B punch  N kick  SPACE special",
+            "P1: ←/→ move  ↑ jump  ↓+← crouch/block  Z punch  X kick  C special"
+            "   ·   P2: J/L move  I jump  K+J crouch/block  B punch  N kick  M special",
             FONT_SMALL, GREY, SCREEN_WIDTH // 2, 580)
 
 
@@ -3060,6 +3286,9 @@ class Game:
         self.states[STATE_FIGHT] = FightState(self, p1_data, p2_data)
         self.state = self.states[STATE_FIGHT]
 
+    # off-screen canvas used by FightState for the screen-shake camera
+    world_canvas = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+
     # ----- main loop -----
     def run(self):
         """Stable 60 FPS loop: events -> update -> draw -> tick."""
@@ -3081,7 +3310,11 @@ class Game:
             # ---- update & draw current state ----
             self.background.update()
             self.state.update(dt)
-            self.state.draw(screen)
+            if self.state.name == STATE_FIGHT:
+                # fights render the world to a canvas first (screen shake)
+                self.state.draw(self.world_canvas)
+            else:
+                self.state.draw(screen)
             pygame.display.flip()
 
         pygame.quit()
