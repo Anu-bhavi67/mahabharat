@@ -481,6 +481,26 @@ class SoundManager:
         self.apply_volumes()
         self.save_settings()
 
+    # ---- convenience mutators used by the pause menu / hotkeys -------
+    def adjust_master(self, delta_pct):
+        """Nudge master volume by a percentage-point delta (pauses save)."""
+        try:
+            new = max(0.0, min(1.0, self.master_volume + delta_pct / 100.0))
+            self.set_volume("master", new)
+        except Exception:                     # never crash on audio tweaks
+            pass
+
+    def toggle_mute(self):
+        """M key: mute everything / restore previous level."""
+        try:
+            if self.master_volume > 0.0:
+                self._prev_master = self.master_volume
+                self.set_volume("master", 0.0)
+            else:
+                self.set_volume("master", getattr(self, "_prev_master", 1.0))
+        except Exception:
+            pass
+
     def status_line(self):
         n_files = len([k for k, v in self.sfx_cache.items() if v])
         mode = "mixer OFF (silent)" if not self.available else \
@@ -5284,6 +5304,15 @@ class FightState(GameState):
         self.tint_color = WHITE          # current veil RGB
         self.hit_freeze_frames = 0       # simulation-pause frames left
         self.lightning_bolts = []        # [(points, color, ttl), ...]
+        # ---- ULTIMATE POLISH: slow-mo + camera zoom-in state ----------
+        self.slowmo_frames = 0           # 25%-speed frames remaining
+        self.slowmo_phase = 0            # frame counter mod 4
+        self.ult_zoom = None             # {"fighter":f,"frames":n} while active
+        # ---- PAUSE SYSTEM (ESC during a fight) -------------------------
+        self.paused = False              # True while pause menu is open
+        self.pause_index = 0             # highlighted pause-menu option
+        self.pause_options = ["RESUME", "RESTART ROUND",
+                              "SETTINGS", "QUIT TO MENU"]
         for f in (self.f1, self.f2):     # wire the shared fx into fighters
             f.fx = self.fx
 
@@ -5605,28 +5634,57 @@ class FightState(GameState):
             self._finish_special_credit(f, foe)
 
     def handle_event(self, event):
-        """KEYDOWN-driven actions: attacks, jump and the special.
+        """KEYDOWN-driven actions: attacks, jump, the special and the
+        ULTIMATE.  Also hosts the PAUSE SYSTEM (ESC opens a frozen menu).
 
         Movement / crouch / block are HOLD-based and handled per-frame in
         _process_movement(); attacks are edge-triggered so holding a key
         does not machine-gun (the 20/25-frame cooldowns also apply)."""
         if event.type != pygame.KEYDOWN:
             return
+        # ----------------------- PAUSE MENU NAVIGATION ------------------
+        if self.paused:
+            k = event.key
+            if k in (pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_SPACE):
+                self.paused = False                    # RESUME
+                play_sound("confirm")
+            elif k in (pygame.K_UP, pygame.K_w):
+                self.pause_index = (self.pause_index - 1) % \
+                    len(self.pause_options)
+                play_sound("select")
+            elif k in (pygame.K_DOWN, pygame.K_s):
+                self.pause_index = (self.pause_index + 1) % \
+                    len(self.pause_options)
+                play_sound("select")
+            elif k == pygame.K_RETURN or k == pygame.K_SPACE:
+                pass                                   # covered above
+            elif k == pygame.K_LEFT:
+                self._pause_adjust(-1)
+            elif k == pygame.K_RIGHT:
+                self._pause_adjust(+1)
+            elif k == pygame.K_m:
+                get_sounds().toggle_mute()             # quick mute toggle
+            return
+        # ----------------------- OPEN THE PAUSE MENU --------------------
         if event.key == pygame.K_ESCAPE:
-            self.game.change_state(STATE_MENU)
+            self.paused = True
+            self.pause_index = 0
+            play_sound("confirm")
             return
         if self.hud_freeze or self.winner:
             return
         k = event.key
         # ---------------- PLAYER 1 : Arrow keys + Z (punch) X (kick) ------
-        if k == pygame.K_UP:
-            self.f1.jump()
+        if k == pygame.K_UP or k == pygame.K_SPACE:
+            self.f1.jump()                             # UP or SPACE jumps
         elif k == pygame.K_z:
             self.f1.start_attack("punch")
         elif k == pygame.K_x:
             self.f1.start_attack("kick")
         elif k == pygame.K_c or k == pygame.K_LCTRL or k == pygame.K_RCTRL:
             self._special_attempt(self.f1)      # P1 astral: C (or Ctrl)
+        elif k == pygame.K_v:
+            self._ultimate_attempt(self.f1)     # ULTIMATE: V (HP<30%+meter)
         # NOTE (OVERHAUL STEP 2): the old human-P2 bindings (I/J/K/L move,
         # B punch, N kick, M special) are GONE — the opponent slot is now
         # exclusively driven by AIBrain via _apply_ai_input().
@@ -5637,6 +5695,62 @@ class FightState(GameState):
             if held_now and not getattr(self, "_ai_up_prev", False):
                 self.f2.jump()
             self._ai_up_prev = held_now
+
+    # ------------------------------------------------------------------
+    # PAUSE SYSTEM helpers
+    # ------------------------------------------------------------------
+    def _pause_select(self, idx):
+        """Execute the highlighted pause-menu option."""
+        self.paused = False
+        opt = self.pause_options[idx]
+        play_sound("confirm")
+        if opt == "RESUME":
+            return
+        if opt == "RESTART ROUND":
+            self._restart_current_round()
+        elif opt == "SETTINGS":
+            self.game.change_state(STATE_SETTINGS)
+        elif opt == "QUIT TO MENU":
+            self.game.change_state(STATE_MENU)
+
+    def _pause_adjust(self, delta):
+        """LEFT/RIGHT tweaks the highlighted setting row (volume etc.)."""
+        opt = self.pause_options[self.pause_index]
+        if opt == "SETTINGS":
+            s = get_sounds()
+            s.adjust_master(delta * 5)                 # coarse ±5%
+
+    def _restart_current_round(self):
+        """PAUSE MENU -> RESTART ROUND: rewind the round that is being
+        fought.  Round wins earned BEFORE this round are kept; HP, meters,
+        projectiles and every screen effect reset to full."""
+        try:
+            self.winner = None
+            self.end_delay_until = None
+            self.match_over = False
+            self.timer_left = 99.0
+            self.hit_sparks.clear()
+            self.combo_pops.clear()
+            self.fx.particles.clear()
+            self.shake_frames = 0
+            self.shake_intensity = 0
+            self.flash_frames = 0
+            self.tint_frames = 0
+            self.hit_freeze_frames = 0
+            self.slowmo_frames = 0
+            self.ult_zoom = None
+            self.lightning_bolts.clear()
+            for f in (self.f1, self.f2):
+                f.projectiles = []
+                f.fx = self.fx
+            self._reset_fighter(self.f1, 1)
+            self._reset_fighter(self.f2, -1)
+            self.round_start = pygame.time.get_ticks()
+            self.taunt_at = self.round_start + random.randint(6000, 9000)
+            self.set_banner(f"ROUND {self.round_number}  ·  RESTART",
+                            SAFFRON, 1300)
+        except Exception as _exc:                     # never crash on pause
+            print(f"[pause-guard] restart: {_exc!r}")
 
     @staticmethod
     def _back_key_action(held_back, down_held):
@@ -5849,13 +5963,23 @@ class FightState(GameState):
                     f.projectiles.remove(pr)
 
     def _drain_fx_requests(self):
-        """Consume the ParticleSystem's queued shake / spark requests."""
+        """Consume the ParticleSystem's queued screen-effect requests:
+        shake / sparks / white flash / colour tint / hit-freeze."""
         for frames, intensity in self.fx.drain_shakes():
             # strongest request wins the amplitude, durations add up
             self.shake_intensity = max(self.shake_intensity, intensity)
             self.shake_frames = max(self.shake_frames, frames)
         for x, y, t, c in self.fx.drain_sparks():
             self.hit_sparks.append((x, y, t, c))
+        # ---- SCREEN EFFECTS: flash overlay / colour veil / hit freeze --
+        for fr in self.fx.drain_flashes():
+            self.flash_frames = max(self.flash_frames, int(fr))
+        for col, fr in self.fx.drain_tints():
+            self.tint_frames = max(self.tint_frames, int(fr))
+            self.tint_color = col
+        for fr in self.fx.drain_freezes():
+            budget = min(int(fr), MAX_FREEZE_FRAMES)
+            self.hit_freeze_frames = max(self.hit_freeze_frames, budget)
         # direct sparks queued inside Fighter._spawn_astra
         for f in (self.f1, self.f2):
             if f._pending_fx_sparks:
@@ -5863,12 +5987,73 @@ class FightState(GameState):
                     self.hit_sparks.append((x, y, t, c))
                 f._pending_fx_sparks.clear()
 
+    # ------------------------------------------------------------------
+    # ULTIMATE ABILITIES — cast attempt + slow-mo / zoom direction
+    # ------------------------------------------------------------------
+    def _ultimate_attempt(self, f):
+        """Try to fire f's ULTIMATE. On success: dramatic banner,
+        20-frame slow-motion and a camera zoom-in on the caster."""
+        foe = self.f2 if f is self.f1 else self.f1
+        try:
+            ok = f.start_ultimate(opponent=foe, fx=self.fx)
+        except Exception as _exc:             # never crash mid-fight
+            print(f"[ult-guard] {f.name}: {_exc!r}")
+            return
+        if not ok:
+            return
+        ult = f.get_ultimate(f.name)
+        self.set_banner(f"{f.name}'s ULTIMATE: {ult.get('name', '')}!",
+                        GOLD, 3000)
+        self.slowmo_frames = 20               # game runs at 25% speed
+        self.ult_zoom = {"fighter": f, "frames": 45}   # camera push-in
+
+    def _update_slowmo_and_zoom(self):
+        """Tick the slow-motion countdown and the ultimate camera zoom.
+        Returns True when this frame should be SKIPPED (25% speed)."""
+        # --- slow-mo: only update every 4th simulation frame -----------
+        skip = False
+        if self.slowmo_frames > 0:
+            self.slowmo_frames -= 1
+            self.slowmo_phase = (self.slowmo_phase + 1) % 4
+            if self.slowmo_phase != 0:
+                skip = True                   # 60 render FPS, 15 sim FPS
+        else:
+            self.slowmo_phase = 0
+        # --- camera zoom-in on the warrior who just unleashed ----------
+        z = self.ult_zoom
+        if z:
+            z["frames"] -= 1
+            try:
+                frac = max(0.0, min(1.0, z["frames"] / 45.0))
+                z["fighter"].draw_scale = 1.0 + 0.28 * frac   # ease back out
+            except Exception:
+                pass
+            if z["frames"] <= 0:
+                try:
+                    z["fighter"].draw_scale = 1.0
+                except Exception:
+                    pass
+                self.ult_zoom = None
+        return skip
+
     def update(self, dt_ms):
         # The main loop hands every state the frame time in MILLISECONDS
         # (clock.tick returns ms); the fight timer works in seconds.
         dt = dt_ms / 1000.0
         now = pygame.time.get_ticks()
         self.fight_frame += 1          # master frame clock (60 FPS)
+        # ---- PAUSE SYSTEM: everything freezes until the menu closes ---
+        if self.paused:
+            return
+        # ---- ULTIMATE / KO DRAMA slow-motion: skip 3 of every 4
+        #      simulation frames (25% speed) while still rendering at 60.
+        if self._update_slowmo_and_zoom():
+            self.fx.update()           # particles keep drifting in slow-mo
+            return
+        # ---- HIT FREEZE: impact pause before anything else moves ------
+        if self.hit_freeze_frames > 0:
+            self.hit_freeze_frames -= 1
+            return
         intro_left = (now - self.round_start) < 1400
         # SOUND TRIGGER: the "FIGHT!" announcer cue, fired exactly once
         # per round the moment controls unlock (also re-armed by the
@@ -5952,11 +6137,14 @@ class FightState(GameState):
         if self.winner and now >= self.end_delay_until:
             if self.match_over:
                 self.game.result_winner = self.winner.name
+                # ---- SAVE SYSTEM: tally the decided match -------------
+                player_won = (self.winner is self.f1)
+                save_save(wins_delta=1 if player_won else 0,
+                          losses_delta=0 if player_won else 1)
                 if getattr(self.game, "game_mode", GAME_VS) == GAME_STORY:
                     # ---- STORY MODE: chapter resolved, no result screen --
                     ch = STORY_CHAPTERS[min(self.game.story_index,
                                             len(STORY_CHAPTERS) - 1)]
-                    player_won = (self.winner is self.f1)
                     self.game.story_last_win = player_won
                     if player_won:
                         self.game.story_progress = max(
@@ -5964,6 +6152,7 @@ class FightState(GameState):
                         self.game.story_index = min(
                             self.game.story_index + 1,
                             len(STORY_CHAPTERS) - 1)
+                    save_save(story_progress=self.game.story_progress)
                     self.game.change_state(STATE_STORY)
                 else:
                     self.game.change_state(STATE_RESULT)
