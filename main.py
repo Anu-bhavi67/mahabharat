@@ -9,8 +9,10 @@
   MENU             : ENTER  -> start game
   CHARACTER_SELECT : P1 uses A/D to browse, W to confirm
                      P2 uses LEFT/RIGHT to browse, UP to confirm
-  FIGHT            : P1: A/D move, W jump, S block, F punch, G kick
-                     P2: arrows move/jump/block, K punch, L kick
+  FIGHT            : P1: A/D move, W jump, S block, C crouch, F punch,
+                          G kick, T special (when meter is full)
+                     P2: arrows move/jump/block, M crouch, K punch,
+                         L kick, ENTER special
   RESULT           : ENTER  -> back to main menu
   Anywhere         : ESC    -> quit
 
@@ -187,62 +189,160 @@ def draw_vertical_gradient_region(surface, region, top_color, bottom_color):
 
 
 # =====================================================================
-# SECTION 4: FIGHTER (simple stick-warrior with health, attacks, AI)
+# SECTION 4: FIGHTER CLASS — detailed procedural stick-figure warriors
 # =====================================================================
-
-GROUND_Y = int(SCREEN_HEIGHT * 0.72) + 200   # feet baseline
+# One Fighter instance == one character on screen.  Everything about a
+# fighter is driven by its CHARACTERS-database record (stats, colours,
+# weapon type, special fx colour); the drawing code builds a warrior out
+# of primitive shapes only — head circle, torso rect, limb lines with
+# fists/feet, a signature weapon silhouette and a glowing astral aura.
+#
+# Physics convention:
+#   self.x    -> horizontal centre (pixels)
+#   self.y    -> HEIGHT ABOVE the ground line (0 == standing on it).
+#                Jumping adds vel_y; gravity pulls back down until y<=0.
+#   GROUND_Y  -> the fixed foot-baseline at y = 430 on screen.
+# ---------------------------------------------------------------------
+GROUND_Y = 430                        # feet baseline (screen y) per spec
+GRAVITY = 0.9                         # downward accel px/frame^2
+JUMP_VELOCITY = 16                    # initial upward launch speed
+FIGHTER_WIDTH = 50                    # standing hitbox width
+STAND_HEIGHT = 150                    # full body height (feet->crown)
+CROUCH_HEIGHT = 95                    # squashed height while crouching
+BODY_LEFT_MARGIN = 35                 # boundary clamp padding
 
 
 class Fighter:
-    """A procedurally-drawn warrior with basic fighting behaviour."""
+    """A fully-featured 2D fighting-game character entity."""
 
-    def __init__(self, name, color, accent, x, facing, controls=None,
-                 data=None):
-        self.name = name
-        self.color = color            # body/tunic colour
-        self.accent = accent          # armour/skin tint
-        self.controls = controls      # dict of key->action, None => AI
-        self.data = data              # full CHARACTERS db entry (optional)
+    def __init__(self, char_data, x, y, facing, is_player2=False,
+                 controls=None):
+        """
+        char_data   : dict — one entry of the CHARACTERS database
+        x, y        : spawn position (y is height above ground, usually 0)
+        facing      : +1 faces right, -1 faces left
+        is_player2  : True for the right-side fighter (mirrors HUD/tags)
+        controls    : keymap dict, or None => fighter runs the built-in AI
+        """
+        self.data = char_data or {}
+        d = self.data
+        self.name = d.get("name", "WARRIOR")
+        self.color = d.get("color", SAFFRON)               # primary
+        self.secondary_color = d.get("secondary_color",     # accents/skin
+                                     tuple(min(255, c + 60)
+                                           for c in self.color))
+        self.weapon = d.get("weapon", "")
+        self.is_player2 = bool(is_player2)
+        self.controls = controls        # None => AI controlled
 
-        # Stats — taken from the character database when available,
-        # otherwise sensible defaults keep the game playable.
-        d = data or {}
+        # ---- stats straight from the character database ----
         self.max_health = int(d.get("health", 100))
-        self.speed = int(d.get("speed", 5))
+        self.health = self.max_health
+        self.speed = max(2, int(d.get("speed", 5)))        # px per frame
         self.punch_damage = int(d.get("punch_damage", 8))
         self.kick_damage = int(d.get("kick_damage", 14))
         self.special_damage = int(d.get("special_damage", 25))
         self.special_name = d.get("special_name", "DIVINE STRIKE")
         self.special_color = d.get("special_color", GOLD)
-        self.weapon = d.get("weapon", "")
-        self.health = self.max_health
-        self.special_meter = 0.0      # 0..100, fills by dealing damage
-        self.projectiles = []         # this fighter's active special blasts
-        self.reset(x, facing)
 
-    # ---------- state helpers ----------
-    def reset(self, x, facing):
+        # ---- pose / physics state ----
         self.x = float(x)
-        self.y = 0.0                  # height above ground (jump offset)
-        self.vy = 0.0
-        self.facing = facing          # +1 looks right, -1 looks left
-        self.vx = 0.0
-        self.state = "idle"           # idle/walk/jump/punch/kick/block/hurt/special
+        self.y = float(y)               # height above GROUND_Y
+        self.vel_y = 0.0                # vertical velocity (jump physics)
+        self.vx = 0.0                   # knockback slide velocity
+        self.facing = 1 if facing >= 0 else -1
+        self.state = "idle"             # idle|walk|jump|crouch|punch|kick|
+                                        # block|hurt|special
         self.state_timer = 0
-        self.attack_hit = False
+        self.attack_hit = False         # melee can only connect once
+        self.anim_time = 0.0            # accumulates frames for animations
+        self.special_meter = 0.0        # 0..100, charged by dealing damage
+        self.projectiles = []           # this fighter's astral blasts
         self.ai_decision_timer = 0
-        self.special_meter = 0.0      # 0..100, fills by dealing damage
-        self.projectiles = []         # this fighter's active special blasts
+
+    # ------------------------------------------------------------------
+    # geometry & collision
+    # ------------------------------------------------------------------
+    def get_rect(self):
+        """Body hitbox.  Crouching halves the effective height so low
+        attacks slip under high ones and vice-versa."""
+        h = CROUCH_HEIGHT if self.state == "crouch" else STAND_HEIGHT
+        foot_y = GROUND_Y - self.y
+        return pygame.Rect(int(self.x) - FIGHTER_WIDTH // 2,
+                           int(foot_y - h), FIGHTER_WIDTH, h)
+
+    # Backwards-compatible alias used elsewhere in the codebase.
+    get_hitbox = get_rect
 
     @property
     def rect(self):
-        """Body hitbox (feet anchored to GROUND_Y minus jump height)."""
-        foot_y = GROUND_Y - self.y
-        return pygame.Rect(int(self.x) - 25, foot_y - 150, 50, 150)
+        return self.get_rect()
+
+    def get_attack_rect(self):
+        """Invisible hurt-box that extends IN FRONT of the fighter while a
+        melee attack is in its active window; empty rect otherwise."""
+        if self.state not in ("punch", "kick"):
+            return pygame.Rect(0, 0, 0, 0)
+        reach = self.attack_range()
+        box_h = 34
+        if self.state == "kick":
+            box_y = GROUND_Y - self.y - 70          # leg-level strike
+        else:
+            box_y = GROUND_Y - self.y - 118         # chest-level strike
+        if self.facing > 0:
+            return pygame.Rect(int(self.x + 15), int(box_y),
+                               int(reach), box_h)
+        return pygame.Rect(int(self.x - 15 - reach), int(box_y),
+                           int(reach), box_h)
+
+    # ------------------------------------------------------------------
+    # actions
+    # ------------------------------------------------------------------
+    def move_left(self):
+        """Walk left at this warrior's own speed (locked during attacks)."""
+        if self._busy():
+            return
+        self.x -= self.speed
+        self.state = "walk"
+        self._clamp_to_stage()
+
+    def move_right(self):
+        if self._busy():
+            return
+        self.x += self.speed
+        self.state = "walk"
+        self._clamp_to_stage()
+
+    def stop_walking(self):
+        if self.state == "walk":
+            self.state = "idle"
+
+    def jump(self):
+        """Launch upward — only from the ground, never mid-attack."""
+        if self.y == 0 and not self._busy():
+            self.vel_y = JUMP_VELOCITY
+            self.state = "jump"
+
+    def crouch(self, active=True):
+        """Hold to shrink the hitbox; also guards low sweeps."""
+        if active and self.y == 0 and self.state in ("idle", "walk",
+                                                     "crouch", "block"):
+            self.state = "crouch"
+        elif not active and self.state == "crouch":
+            self.state = "idle"
+
+    def block(self):
+        if self.y == 0 and self.state in ("idle", "walk", "crouch"):
+            self.state = "block"
+            self.state_timer = 20
+
+    def _busy(self):
+        return self.state in ("punch", "kick", "hurt", "special")
 
     # ---------- combat ----------
     def start_attack(self, kind):
-        if self.state in ("idle", "walk"):
+        """Begin a punch or kick (only from neutral stances)."""
+        if self.state in ("idle", "walk", "crouch"):
             self.state = kind
             self.state_timer = 18 if kind == "punch" else 26
             self.attack_hit = False
@@ -272,49 +372,64 @@ class Fighter:
         return self.special_damage
 
     def attack_range(self):
+        """Melee reach depends on the strike — kicks travel further."""
         return 70 if self.state == "punch" else 95
 
     def take_hit(self, dmg, from_facing):
+        """Receive damage: stagger state + knockback slide."""
         self.health = max(0, self.health - dmg)
         self.state = "hurt"
         self.state_timer = 14
         self.vx = from_facing * 6      # knockback
-        if self.x < 40:
-            self.x = 40
-        if self.x > SCREEN_WIDTH - 40:
-            self.x = SCREEN_WIDTH - 40
+        self._clamp_to_stage()
 
-    # ---------- per-frame update ----------
-    def update(self, opponent):
-        # gravity / jump
-        if self.y > 0 or self.vy != 0:
-            self.vy -= 0.9
-            self.y += self.vy
-            if self.y <= 0:
-                self.y, self.vy = 0, 0
+    # ------------------------------------------------------------------
+    # per-frame physics / animation update
+    # ------------------------------------------------------------------
+    def _clamp_to_stage(self):
+        """Boundary clamping — a warrior can never leave the arena."""
+        self.x = max(BODY_LEFT_MARGIN,
+                     min(SCREEN_WIDTH - BODY_LEFT_MARGIN, self.x))
+
+    def apply_gravity(self):
+        """Vertical velocity + ground detection at y = GROUND_Y (offset 0)."""
+        if self.y > 0 or self.vel_y != 0:
+            self.vel_y -= GRAVITY
+            self.y += self.vel_y
+            if self.y <= 0:                    # touched down on the ground
+                self.y, self.vel_y = 0.0, 0.0
                 if self.state == "jump":
                     self.state = "idle"
 
-        # knockback decay
+    def update(self, opponent):
+        # --- jump / gravity physics ---
+        self.apply_gravity()
+
+        # --- knockback slide decay ---
         self.x += self.vx
         self.vx *= 0.8
         if abs(self.vx) < 0.3:
-            self.vx = 0
-        self.x = max(35, min(SCREEN_WIDTH - 35, self.x))
+            self.vx = 0.0
+        self._clamp_to_stage()
 
-        # face the opponent unless mid-attack
-        if self.state not in ("punch", "kick", "hurt"):
+        # --- facing auto-updates to look at the opponent ---
+        # (locked while committed to an attack or recoiling)
+        if opponent is not None and \
+                self.state not in ("punch", "kick", "special", "hurt"):
             self.facing = 1 if opponent.x > self.x else -1
 
-        # timers
+        # --- action timers ---
         if self.state_timer > 0:
             self.state_timer -= 1
             if self.state_timer == 0 and self.state in (
                     "punch", "kick", "hurt", "block", "special"):
                 self.state = "idle"
 
-        # AI control for player-less fighters
-        if self.controls is None:
+        # --- advance the animation clock (bobbing / leg cycle) ---
+        self.anim_time += 1.0
+
+        # --- AI control for player-less fighters ---
+        if self.controls is None and opponent is not None:
             self.update_ai(opponent)
 
     def update_ai(self, opponent):
@@ -342,135 +457,226 @@ class Fighter:
         elif roll < 0.75:
             self.start_attack(random.choice(["punch", "kick"]))
         elif roll < 0.85 and self.y == 0:
-            self.vy = 16                        # hop
-            self.state = "jump"
+            self.jump()                         # little hop
         else:
             self.state = "idle"
 
-    # ---------- drawing ----------
-    def draw(self, target):
-        foot_y = GROUND_Y - self.y
-        f = self.facing
-        cx = int(self.x)
-        data = self.data or {}
-        accent = tuple(data.get("secondary_color",
-                                tuple(min(255, c + 60) for c in self.color)))
+    # ==================================================================
+    # DRAWING — a detailed procedural stick-figure WARRIOR
+    # ==================================================================
+    # Built entirely from pygame.draw primitives:
+    #   head (circle + crown), torso (rect + sash), arms (lines + fists),
+    #   legs (lines + feet), signature weapon silhouette, and a soft
+    #   glowing aura tinted with the character's special_color.
+    # ------------------------------------------------------------------
+    def _draw_aura(self, target, cx, foot_y):
+        """Pulsing translucent glow ring around the body, drawn in the
+        character's special_color (brighter when the meter is full)."""
+        pulse = 0.5 + 0.5 * math.sin(self.anim_time * 0.09)
+        ready = self.special_meter >= 100
+        base_alpha = 70 if not ready else 110
+        layers = ((52, int(base_alpha * 0.35)),
+                  (40, int(base_alpha * 0.6 + 14 * pulse)),
+                  (28, int(base_alpha * 0.85 + 20 * pulse)))
+        for radius, alpha in layers:
+            surf = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+            pygame.draw.circle(surf, (*self.special_color, min(alpha, 255)),
+                               (radius, radius), radius, 3)
+            target.blit(surf, (cx - radius, int(foot_y - 82) - radius))
 
-        # shadow
-        sh = pygame.Surface((90, 16), pygame.SRCALPHA)
-        pygame.draw.ellipse(sh, (0, 0, 0, 90), (0, 0, 90, 16))
-        target.blit(sh, (cx - 45, GROUND_Y - 8))
-
-        skin = accent
-        leg_w, arm_w = 6, 5
-
-        # legs (slight walk sway)
-        sway = 0
-        if self.state == "walk":
-            sway = int(6 * math.sin(pygame.time.get_ticks() * 0.02))
-        pygame.draw.line(target, skin, (cx, foot_y - 70),
-                         (cx - 14 + sway, foot_y), leg_w)
-        pygame.draw.line(target, skin, (cx, foot_y - 70),
-                         (cx + 14 - sway, foot_y), leg_w)
-
-        # torso (tunic)
-        pygame.draw.rect(target, self.color,
-                         (cx - 16, foot_y - 125, 32, 58), border_radius=8)
-        # golden armour sash
-        pygame.draw.line(target, GOLD, (cx - 16, foot_y - 100),
-                         (cx + 16, foot_y - 112), 4)
-
-        # head + crown/helmet
-        pygame.draw.circle(target, skin, (cx, foot_y - 140), 15)
-        pygame.draw.polygon(target, GOLD, [(cx - 12, foot_y - 148),
-                                           (cx, foot_y - 168),
-                                           (cx + 12, foot_y - 148)])
-
-        # signature weapon silhouette (drawn from the database 'weapon')
-        wpn = str(data.get("weapon", ""))
-        if "Bow" in wpn:                       # celestial bow held at the ready
+    def _draw_weapon(self, target, cx, foot_y, f, skin):
+        """Signature weapon chosen from the database 'weapon' field."""
+        wpn = str(self.weapon)
+        if "Bow" in wpn:                    # Gandiva / Vijaya / divine bows
             pts = [(cx + f * 26, foot_y - 150), (cx + f * 40, foot_y - 115),
                    (cx + f * 26, foot_y - 80)]
-            pygame.draw.lines(target, accent, False, pts, 3)
-            pygame.draw.line(target, GREY, pts[0], pts[2], 1)
-        elif "Gada" in wpn or "Mace" in wpn:   # giant mace over the shoulder
-            pygame.draw.line(target, (120, 80, 40), (cx + f * 20, foot_y - 95),
-                             (cx + f * 42, foot_y - 150), 5)
-            pygame.draw.circle(target, accent, (cx + f * 46, foot_y - 155), 11)
-        elif "Spear" in wpn:                   # shaft + leaf-shaped head
-            pygame.draw.line(target, (120, 80, 40), (cx + f * 18, foot_y - 70),
+            pygame.draw.lines(target, self.secondary_color, False, pts, 3)
+            pygame.draw.line(target, GREY, pts[0], pts[2], 1)   # bowstring
+        if "Gada" in wpn or "Mace" in wpn:  # Bhima / Duryodhana mace
+            pygame.draw.line(target, (120, 80, 40),
+                             (cx + f * 20, foot_y - 95),
+                             (cx + f * 44, foot_y - 152), 5)
+            pygame.draw.circle(target, self.secondary_color,
+                               (cx + f * 47, foot_y - 157), 11)
+            pygame.draw.circle(target, GOLD, (cx + f * 47, foot_y - 157),
+                               11, 2)
+        if "Spear" in wpn:                  # Yudhishthira's dharma spear
+            pygame.draw.line(target, (120, 80, 40),
+                             (cx + f * 18, foot_y - 70),
                              (cx + f * 46, foot_y - 165), 4)
-            pygame.draw.polygon(target, accent,
+            pygame.draw.polygon(target, self.secondary_color,
                                 [(cx + f * 42, foot_y - 158),
                                  (cx + f * 52, foot_y - 178),
                                  (cx + f * 50, foot_y - 156)])
-        elif "Sword" in wpn:                   # blade raised
+        if "Sword" in wpn:                  # Abhimanyu / Ashwatthama blade
             pygame.draw.line(target, (200, 200, 215),
                              (cx + f * 22, foot_y - 105),
                              (cx + f * 44, foot_y - 155), 4)
             pygame.draw.line(target, GOLD, (cx + f * 18, foot_y - 100),
-                             (cx + f * 28, foot_y - 108), 4)
-        elif "Dice" in wpn:                    # enchanted dice floating at palm
-            dcx, dcy = cx + f * 34, foot_y - 118
-            pygame.draw.rect(target, accent, (dcx - 8, dcy - 8, 16, 16),
-                             border_radius=3)
+                             (cx + f * 28, foot_y - 108), 4)   # guard
+        if "Dice" in wpn:                   # Shakuni's enchanted dice
+            t = self.anim_time * 0.12
+            dcx = cx + f * 34 + int(3 * math.sin(t))
+            dcy = foot_y - 118 + int(3 * math.cos(t))
+            pygame.draw.rect(target, self.secondary_color,
+                             (dcx - 8, dcy - 8, 16, 16), border_radius=3)
             for px, py in ((-4, -4), (0, 0), (4, 4)):
                 pygame.draw.circle(target, BLACK, (dcx + px, dcy + py), 2)
+        if "Kavach" in wpn or "Gem" in wpn:  # divine armour / forehead gem
+            pygame.draw.circle(target, GOLD, (cx + f * 4, foot_y - 146), 4)
 
-        # arms — pose depends on state
-        shoulder_l = (cx - 15, foot_y - 118)
-        shoulder_r = (cx + 15, foot_y - 118)
+    def draw(self, target):
+        f = self.facing
+        cx = int(self.x)
+        foot_y = int(GROUND_Y - self.y)
+        skin = self.secondary_color          # limb / face tint
+        leg_w, arm_w = 6, 5
+
+        # ---- crouch compresses the whole skeleton proportionally ----
+        squash = 0.62 if self.state == "crouch" else 1.0
+        hip_y = foot_y - int(70 * squash)
+        chest_y = foot_y - int(118 * squash)
+        neck_y = foot_y - int(128 * squash)
+        head_y = foot_y - int(142 * squash)
+
+        # ---- idle bobbing (math.sin) & walking leg cycle ----
+        bob = 0
+        if self.state == "idle":
+            bob = int(2.5 * math.sin(self.anim_time * 0.07))
+        sway = 0
+        if self.state == "walk":
+            sway = int(7 * math.sin(self.anim_time * 0.25))
+        # apply bob to everything above the hips
+        hip_y += bob // 2
+        chest_y += bob
+        neck_y += bob
+        head_y += bob
+
+        # ---- ground shadow (stays put while jumping) ----
+        sh_scale = max(0.4, 1.0 - self.y / 260.0)
+        sw = int(90 * sh_scale)
+        sh = pygame.Surface((sw, 16), pygame.SRCALPHA)
+        pygame.draw.ellipse(sh, (0, 0, 0, int(90 * sh_scale)),
+                            (0, 0, sw, 16))
+        target.blit(sh, (cx - sw // 2, GROUND_Y - 8))
+
+        # ---- glowing astral aura (special_color) ----
+        self._draw_aura(target, cx, foot_y)
+
+        # ---- legs (lines) + feet (small rects) ----
+        kick_ext = 0
+        if self.state == "kick":
+            kick_ext = int(math.sin(self.state_timer / 26 * math.pi) * 55)
+        if self.state != "kick":
+            # left leg
+            lx = cx - 14 + sway
+            pygame.draw.line(target, skin, (cx, hip_y), (lx, foot_y), leg_w)
+            pygame.draw.rect(target, GOLD, (lx - 7, foot_y - 4, 14, 6),
+                             border_radius=2)          # foot
+            # right leg
+            rx = cx + 14 - sway
+            pygame.draw.line(target, skin, (cx, hip_y), (rx, foot_y), leg_w)
+            pygame.draw.rect(target, GOLD, (rx - 7, foot_y - 4, 14, 6),
+                             border_radius=2)          # foot
+        else:
+            # support leg
+            pygame.draw.line(target, skin, (cx, hip_y),
+                             (cx - 12, foot_y), leg_w)
+            pygame.draw.rect(target, GOLD, (cx - 19, foot_y - 4, 14, 6),
+                             border_radius=2)
+            # extended kicking leg + foot
+            kx = cx + f * (25 + kick_ext)
+            ky = foot_y - int(55 * squash)
+            pygame.draw.line(target, skin, (cx, hip_y), (kx, ky), leg_w)
+            pygame.draw.rect(target, GOLD, (kx - 6, ky - 4, 14, 7),
+                             border_radius=2)
+
+        # ---- torso (rectangle = battle tunic) ----
+        torso_h = int(58 * squash)
+        pygame.draw.rect(target, self.color,
+                         (cx - 16, chest_y - 7, 32, torso_h),
+                         border_radius=8)
+        # golden armour sash across the chest
+        pygame.draw.line(target, GOLD, (cx - 16, chest_y + torso_h - 18),
+                         (cx + 16, chest_y - 2), 4)
+
+        # ---- head (circle) + crown/mukut ----
+        pygame.draw.circle(target, skin, (cx, head_y), 15)
+        pygame.draw.polygon(target, GOLD, [(cx - 12, head_y - 6),
+                                           (cx, head_y - 26),
+                                           (cx + 12, head_y - 6)])
+        # eye looking in facing direction
+        pygame.draw.circle(target, BLACK, (cx + f * 6, head_y - 2), 2)
+
+        # ---- signature weapon (bow/mace/sword/spear/dice) ----
+        self._draw_weapon(target, cx, foot_y, f, skin)
+
+        # ---- arms (lines) + fists (circles), pose per state ----
+        shoulder_l = (cx - 15, chest_y)
+        shoulder_r = (cx + 15, chest_y)
         if self.state == "special":
-            # both arms thrust forward, channeling the astral weapon
+            # both arms thrust forward channeling the astral weapon
             glow = int(20 + 12 * math.sin(self.state_timer * 0.5))
-            end = (cx + f * 55, foot_y - 112)
+            end = (cx + f * 55, chest_y + 6)
             pygame.draw.line(target, skin, shoulder_l, end, arm_w)
             pygame.draw.line(target, skin, shoulder_r, end, arm_w)
+            pygame.draw.circle(target, GOLD, end, 6)      # joined fists
             aura = pygame.Surface((glow * 2, glow * 2), pygame.SRCALPHA)
             pygame.draw.circle(aura, (*self.special_color, 160),
                                (glow, glow), glow)
             target.blit(aura, (end[0] - glow, end[1] - glow))
         elif self.state == "punch":
             ext = int(self.state_timer / 18 * 45)
-            end = (cx + f * (30 + 45 - ext), foot_y - 112)
-            pygame.draw.line(target, skin, (cx, foot_y - 118), end, arm_w)
-            pygame.draw.circle(target, GOLD, end, 7)     # fist glow
-            pygame.draw.line(target, skin, shoulder_l if f > 0
-                             else shoulder_r,
-                             (cx - f * 12, foot_y - 95), arm_w)
+            end = (cx + f * (30 + 45 - ext), chest_y + 6)
+            pygame.draw.line(target, skin, (cx, chest_y), end, arm_w)
+            pygame.draw.circle(target, GOLD, end, 7)      # fist
+            back = shoulder_l if f > 0 else shoulder_r
+            pygame.draw.line(target, skin, back,
+                             (cx - f * 12, chest_y + 22), arm_w)
+            pygame.draw.circle(target, skin,
+                               (cx - f * 12, chest_y + 24), 5)
         elif self.state == "kick":
-            pygame.draw.line(target, skin, (cx, foot_y - 118),
-                             (cx - f * 18, foot_y - 100), arm_w)
-            # extended kicking leg
-            ext = int(math.sin(self.state_timer / 26 * math.pi) * 55)
-            pygame.draw.line(target, skin, (cx, foot_y - 70),
-                             (cx + f * (25 + ext), foot_y - 55), leg_w)
+            pygame.draw.line(target, skin, (cx, chest_y),
+                             (cx - f * 18, chest_y + 18), arm_w)
+            pygame.draw.line(target, skin, shoulder_l if f > 0 else
+                             shoulder_r, (cx + f * 10, chest_y + 24), arm_w)
         elif self.state == "block":
-            pygame.draw.line(target, skin, shoulder_l, (cx + f * 8,
-                             foot_y - 135), arm_w)
-            pygame.draw.line(target, skin, shoulder_r, (cx + f * 10,
-                             foot_y - 125), arm_w)
+            pygame.draw.line(target, skin, shoulder_l,
+                             (cx + f * 8, neck_y - 6), arm_w)
+            pygame.draw.line(target, skin, shoulder_r,
+                             (cx + f * 10, chest_y), arm_w)
             shield = pygame.Surface((44, 90), pygame.SRCALPHA)
             pygame.draw.rect(shield, (*GOLD, 120), (0, 0, 44, 90),
                              border_radius=10)
             target.blit(shield, (cx + f * 14 - (0 if f > 0 else 44),
-                                 foot_y - 140))
-        else:
+                                 neck_y - 14))
+        elif self.state == "crouch":
+            # arms tucked low, guarding stance
             pygame.draw.line(target, skin, shoulder_l,
-                             (cx - 18, foot_y - 90), arm_w)
+                             (cx - f * 4, hip_y - 6), arm_w)
             pygame.draw.line(target, skin, shoulder_r,
-                             (cx + 18, foot_y - 90), arm_w)
+                             (cx + f * 12, hip_y - 10), arm_w)
+            pygame.draw.circle(target, GOLD, (cx + f * 12, hip_y - 10), 5)
+        else:
+            # relaxed guard: fists held at sides
+            el = (cx - 18, chest_y + 28)
+            er = (cx + 18, chest_y + 28)
+            pygame.draw.line(target, skin, shoulder_l, el, arm_w)
+            pygame.draw.line(target, skin, shoulder_r, er, arm_w)
+            pygame.draw.circle(target, GOLD, el, 5)       # fists
+            pygame.draw.circle(target, GOLD, er, 5)
 
-        # hurt flash
+        # ---- hurt flash ----
         if self.state == "hurt":
             flash = pygame.Surface((60, 160), pygame.SRCALPHA)
             pygame.draw.rect(flash, (255, 60, 60, 90), (0, 0, 60, 160),
                              border_radius=10)
             target.blit(flash, (cx - 30, foot_y - 160))
 
-        # name tag
-        draw_centered_text(target, self.name, FONT_SMALL, WHITE, cx,
-                           foot_y - 185, shadow=True)
+        # ---- name tag (P1/P2 prefix so sides are obvious) ----
+        label = ("P2 · " if self.is_player2 else "P1 · ") + self.name
+        draw_centered_text(target, label, FONT_SMALL, WHITE, cx,
+                           foot_y - STAND_HEIGHT - 38, shadow=True)
 
 
 # =====================================================================
@@ -771,10 +977,12 @@ def get_character(name):
 
 
 P1_KEYS = {pygame.K_a: "left", pygame.K_d: "right", pygame.K_w: "jump",
-           pygame.K_s: "block", pygame.K_f: "punch", pygame.K_g: "kick",
+           pygame.K_s: "block", pygame.K_c: "crouch",
+           pygame.K_f: "punch", pygame.K_g: "kick",
            pygame.K_t: "special"}
 P2_KEYS = {pygame.K_LEFT: "left", pygame.K_RIGHT: "right",
            pygame.K_UP: "jump", pygame.K_DOWN: "block",
+           pygame.K_m: "crouch",
            pygame.K_k: "punch", pygame.K_l: "kick",
            pygame.K_RETURN: "special"}
 
@@ -1018,12 +1226,12 @@ class FightState(GameState):
 
     def __init__(self, game, p1_data, p2_data):
         super().__init__(game)
-        self.f1 = Fighter(p1_data["name"], p1_data["color"],
-                          p1_data["secondary_color"], 300, 1, P1_KEYS,
-                          data=p1_data)
-        self.f2 = Fighter(p2_data["name"], p2_data["color"],
-                          p2_data["secondary_color"], 900, -1, P2_KEYS,
-                          data=p2_data)
+        # Fighters are built straight from the CHARACTERS database records.
+        # y = 0 means "standing on the ground line" (GROUND_Y == 430).
+        self.f1 = Fighter(p1_data, 300, 0, facing=1, is_player2=False,
+                          controls=P1_KEYS)
+        self.f2 = Fighter(p2_data, 900, 0, facing=-1, is_player2=True,
+                          controls=P2_KEYS)
         self.round_start = pygame.time.get_ticks()
         self.winner = None
         self.end_delay_until = None
@@ -1052,18 +1260,16 @@ class FightState(GameState):
                     continue
                 for key, action in f.controls.items():
                     if event.key == key:
-                        if action == "jump" and f.y == 0 and \
-                                f.state in ("idle", "walk"):
-                            f.vy = 16
-                            f.state = "jump"
+                        if action == "jump":
+                            f.jump()
                         elif action == "punch":
                             f.start_attack("punch")
                         elif action == "kick":
                             f.start_attack("kick")
-                        elif action == "block" and \
-                                f.state in ("idle", "walk"):
-                            f.state = "block"
-                            f.state_timer = 20
+                        elif action == "block":
+                            f.block()
+                        elif action == "crouch":
+                            f.crouch(True)
                         elif action == "special":
                             if f.start_special():
                                 self.set_banner(f.data["special_dialogue"],
@@ -1075,24 +1281,29 @@ class FightState(GameState):
         for f in (self.f1, self.f2):
             if f.controls is None or self.winner:
                 continue
-            speed = max(2, f.speed)
             moving = False
+            crouching = False
             for key, action in f.controls.items():
                 if pressed[key]:
                     if action == "left":
-                        f.x -= speed
+                        f.move_left()
                         moving = True
                     elif action == "right":
-                        f.x += speed
+                        f.move_right()
                         moving = True
-            f.x = max(35, min(SCREEN_WIDTH - 35, f.x))
-            if f.state == "walk" and not moving:
-                f.state = "idle"
-            if moving and f.state == "idle":
-                f.state = "walk"
+                    elif action == "crouch":
+                        crouching = True
+            if crouching:
+                f.crouch(True)
+            elif f.state == "crouch":          # release the crouch key
+                f.crouch(False)
+            if not moving and f.state == "walk":
+                f.stop_walking()
 
     def _resolve_hits(self):
-        """Check active melee attacks against the opponent's hitbox."""
+        """Check active melee attacks against the opponent's hitbox.
+        Uses the Fighter.get_attack_rect() front-box vs get_rect() body-box,
+        so crouching genuinely ducks under high punches."""
         for attacker, defender in ((self.f1, self.f2), (self.f2, self.f1)):
             if attacker.state not in ("punch", "kick") or attacker.attack_hit:
                 continue
@@ -1100,24 +1311,23 @@ class FightState(GameState):
             progress = 1 - attacker.state_timer / total
             if not (0.3 < progress < 0.75):     # only the active window hits
                 continue
-            reach = attacker.attack_range()
-            dx = defender.x - attacker.x
-            if 0 < dx * attacker.facing and abs(dx) < reach and \
-                    abs(defender.y - attacker.y) < 120:
-                attacker.attack_hit = True
-                dmg = attacker.current_damage()
-                if defender.state == "block":
-                    dmg = max(1, dmg // 4)
-                    spark_col = GOLD
-                else:
-                    spark_col = DEEP_RED
-                defender.take_hit(dmg, attacker.facing)
-                attacker.special_meter = min(100, attacker.special_meter +
-                                             dmg * 1.6)
-                self.hit_sparks.append((attacker.x + attacker.facing *
-                                        reach * 0.7,
-                                        GROUND_Y - defender.y - 110,
-                                        12, spark_col))
+            atk_box = attacker.get_attack_rect()
+            if not atk_box.colliderect(defender.get_rect()):
+                continue
+            attacker.attack_hit = True
+            dmg = attacker.current_damage()
+            if defender.state in ("block", "crouch"):
+                dmg = max(1, dmg // 4)          # guard/crouch absorbs most
+                spark_col = GOLD
+            else:
+                spark_col = DEEP_RED
+            defender.take_hit(dmg, attacker.facing)
+            attacker.special_meter = min(100, attacker.special_meter +
+                                         dmg * 1.6)
+            self.hit_sparks.append((attacker.x + attacker.facing *
+                                    attacker.attack_range() * 0.7,
+                                    GROUND_Y - defender.y - 110,
+                                    12, spark_col))
 
     def _resolve_projectiles(self):
         """Astral weapon blasts fly across the field until they connect."""
@@ -1182,7 +1392,7 @@ class FightState(GameState):
 
         # hit sparks
         for x, y, t, c in self.hit_sparks:
-            rad = (12 - t) * 3 + 6
+            rad = max(6, (12 - t) * 3 + 6)      # keep radius positive
             spark = pygame.Surface((rad * 2, rad * 2), pygame.SRCALPHA)
             pygame.draw.circle(spark, (*c, 200), (rad, rad), rad)
             pygame.draw.circle(spark, (*GOLD, 255), (rad, rad), rad // 2)
@@ -1274,8 +1484,8 @@ class FightState(GameState):
                            SCREEN_WIDTH // 2, 42, shadow=True)
         # control reminder
         draw_centered_text(target,
-                           "P1: A/D W S F G T(special)   |   "
-                           "P2: ARROWS K L ENTER(special)   |   ESC: menu",
+                           "P1: A/D move  W jump  S block  C crouch  F/G hit  T special   |   "
+                           "P2: ARROWS  DOWN block  M crouch  K/L hit  ENTER special",
                            FONT_SMALL, GREY, SCREEN_WIDTH // 2, 580)
 
 
