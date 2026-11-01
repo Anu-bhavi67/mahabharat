@@ -481,6 +481,26 @@ class SoundManager:
         self.apply_volumes()
         self.save_settings()
 
+    # ---- convenience mutators used by the pause menu / hotkeys -------
+    def adjust_master(self, delta_pct):
+        """Nudge master volume by a percentage-point delta (pauses save)."""
+        try:
+            new = max(0.0, min(1.0, self.master_volume + delta_pct / 100.0))
+            self.set_volume("master", new)
+        except Exception:                     # never crash on audio tweaks
+            pass
+
+    def toggle_mute(self):
+        """M key: mute everything / restore previous level."""
+        try:
+            if self.master_volume > 0.0:
+                self._prev_master = self.master_volume
+                self.set_volume("master", 0.0)
+            else:
+                self.set_volume("master", getattr(self, "_prev_master", 1.0))
+        except Exception:
+            pass
+
     def status_line(self):
         n_files = len([k for k, v in self.sfx_cache.items() if v])
         mode = "mixer OFF (silent)" if not self.available else \
@@ -1096,6 +1116,10 @@ class Fighter:
         # ---- pose / physics state ----
         self.x = float(x)
         self.y = float(y)               # height above GROUND_Y
+        # ---- SOUND SYSTEM: remember the spawn height so the landing
+        # "thud" (play_sound("jump")) only fires after a REAL jump,
+        # never on the round-reset snap back to the floor.
+        self._prev_y = float(y)
         self.vel_y = 0.0                # vertical velocity (jump physics)
         self.vx = 0.0                   # knockback slide velocity
         self.vy = 0.0                   # knockback LIFT velocity (air pop)
@@ -1159,6 +1183,38 @@ class Fighter:
         # input pipeline a human uses, so the AI walks / jumps / blocks /
         # crouches exactly like a player would.
         self.brain = None                 # AIBrain | None (human controlled)
+        # =================== BUG-FIX GUARANTEED DEFAULTS ================
+        # Every combat timer / pose flag the simulation may read MUST have
+        # a default here so no code path can ever raise AttributeError.
+        # (state_timer is the master attack/hurt countdown; the mirrored
+        #  boolean flags below are derived from `self.state` every frame.)
+        self.state_timer = 0              # frames left in punch/kick/hurt
+        self.attack_timer = 0             # alias of state_timer (compat)
+        self.hit_timer = 0                # alias of hit_flash   (compat)
+        self.special_timer = 0            # frames left casting an astra
+        self.stun_timer = 0               # total stun budget this frame
+        self.dodge_timer = 0              # invulnerability frames left
+        self.anim_frame = 0               # integer animation step
+        self.passive_timer = 0            # per-second upkeep tick (Bhishma)
+        self.is_hit = False               # True while recoiling
+        self.is_blocking = False          # guarding right now
+        self.is_crouching = False         # ducking right now
+        self.is_jumping = False           # airborne right now
+        self.is_punching = False          # punch swing active
+        self.is_kicking = False           # kick swing active
+        self.is_special = False           # astral move in progress
+        self.on_ground = True             # grounded contact flag
+
+        # ================= ULTIMATE ABILITY SYSTEM STATE ================
+        # A second, far more devastating astra that only awakens when the
+        # warrior is cornered: HP below 30% AND the astral meter full.
+        # Pressed with V (P1) or commanded by the AI brain for P2.
+        self.ultimate_meter = 0.0         # 0..100 charge of the ultimate
+        self.ultimate_ready = False       # True while conditions are met
+        self.ultimate_cooldown = 0        # frames before it can fire again
+        self.ultimate_used = False        # Karna's Vasavi Shakti: once/match
+        self.ult_active = None            # dict describing the live effect
+        self._ult_credit = []             # instant-hit damage needing credit
 
     # ------------------------------------------------------------------
     # COMBAT TIMING CONSTANTS (per spec)
@@ -1231,14 +1287,14 @@ class Fighter:
         """Walk left at this warrior's own speed (locked during attacks)."""
         if self._busy():
             return
-        self.x -= self.speed
+        self.x -= self.effective_speed      # PASSIVE: Abhimanyu +20%
         self.state = "walk"
         self._clamp_to_stage()
 
     def move_right(self):
         if self._busy():
             return
-        self.x += self.speed
+        self.x += self.effective_speed      # PASSIVE: Abhimanyu +20%
         self.state = "walk"
         self._clamp_to_stage()
 
@@ -1330,10 +1386,13 @@ class Fighter:
 
         # ---- drain the meter completely ----
         self.special_meter = 0.0
+        # SOUND TRIGGER: per-character astral cue ("special_arjuna" etc.)
+        play_sound("special_" + self.name.lower())
         # channeling pose: arms thrust forward, melee box must NOT connect
         self.state = "punch"
         self.attack_total = CAST_FRAMES
         self.state_timer = CAST_FRAMES
+        self._cast_frames = CAST_FRAMES   # drives Fighter.special_timer
         self.punch_cooldown = max(self.punch_cooldown, CAST_FRAMES)
         self.attack_hit = True
         self.is_channeling = True
@@ -1578,16 +1637,367 @@ class Fighter:
         finish(flash_frames=0)
 
     def current_damage(self):
-        """Damage table straight from the CHARACTERS database."""
-        if self.state == "punch":
-            return self.punch_damage
-        if self.state == "kick":
-            return self.kick_damage
-        return self.special_damage
+        """Damage table straight from the CHARACTERS database, scaled by
+        this warrior's passive (Bhima +15% melee) and any active ultimate
+        buff (Bhishma x2 during ICCHA MRITYU, Yudhishthira +50%)."""
+        base = self.punch_damage if self.state == "punch" else \
+            self.kick_damage if self.state == "kick" else self.special_damage
+        return max(1, int(round(base * self.damage_boost())))
 
     def attack_range(self):
         """Melee reach depends on the strike — kicks travel further."""
         return 70 if self.state == "punch" else 95
+
+    # ==================================================================
+    # UNIQUE SPECIAL POWERS & UPGRADED ABILITIES SYSTEM
+    #   * every warrior owns a PASSIVE that is always active
+    #   * every warrior owns an ULTIMATE that awakens at HP < 30% while
+    #     the astral meter is FULL (V key for P1, brain-driven for CPU)
+    # ==================================================================
+    ULT_HP_THRESHOLD = 0.30      # ultimate needs HP below 30% ...
+    ULT_COOLDOWN_FRAMES = 600    # ... and then rests for 10 seconds
+    ULT_CAST_FRAMES = 24         # channel time before the effect fires
+
+    # ---- STEP 1: the second special (ULTIMATE) per character ----------
+    ULTIMATES = {
+        "ARJUNA": dict(
+            name="PASHUPATASTRA", damage=50, kind="cosmic_beam",
+            color=(210, 235, 255), unblockable=True, dialogue=
+            "Mahadev! Grant me the Pashupatastra!", desc=
+            "Shiva's ultimate weapon — a cosmic beam across the whole sky."),
+        "KARNA": dict(
+            name="VASAVI SHAKTI", damage=55, kind="spear",
+            color=(255, 210, 90), unblockable=False, once_per_match=True,
+            dialogue="This spear was meant for Arjuna... now you face it!",
+            desc="Indra's one-time divine spear — instant, piercing death."),
+        "BHIMA": dict(
+            name="RUDRA TANDAV", damage=45, kind="radial_shock",
+            color=(220, 70, 40), unblockable=False, hits=3, dialogue=
+            "I will drink Duryodhana's blood! RUDRA!", desc=
+            "Dance of destruction — an eight-direction shockwave that cracks earth."),
+        "DURYODHANA": dict(
+            name="GADA PRALAYA", damage=48, kind="aoe_slam",
+            color=(170, 70, 220), unblockable=False, dialogue=
+            "I am the king of kings! Bow before me!", desc=
+            "Mace apocalypse — leap skyward, slam down in a huge purple ring."),
+        "BHISHMA PITAMAH": dict(
+            name="ICCHA MRITYU", damage=0, kind="invincible_buff",
+            color=(220, 225, 235), unblockable=True, duration=300, dialogue=
+            "I choose when to fall. Not today!", desc=
+            "Death at will — five seconds invincible with double damage."),
+        "ABHIMANYU": dict(
+            name="CHAKRAVYUHA MASTER", damage=10, kind="multi_hit",
+            color=(90, 235, 255), unblockable=False, hits=7, interval=6,
+            dialogue="Father taught me to enter... now I know how to destroy!",
+            desc="Breaks all defences — seven sword slashes, 70 total damage."),
+        "DRONACHARYA": dict(
+            name="BRAHMASTRA", damage=50, kind="fireball",
+            color=(90, 235, 110), unblockable=False, splash=15, dialogue=
+            "I taught you this weapon... now feel its true power!",
+            desc="A green fireball that detonates with secondary blast damage."),
+        "ASHWATTHAMA": dict(
+            name="NARAYANASTRA UNLEASHED", damage=8, kind="arrow_rain",
+            color=(235, 60, 60), unblockable=False, hits=10, interval=12,
+            dialogue="My curse becomes your doom!",
+            desc="Ten rain-arrows over two seconds under a crimson sky."),
+        "YUDHISHTHIRA": dict(
+            name="SATYA VACHAN", damage=0, kind="heal_buff",
+            color=(255, 225, 120), unblockable=True, heal=40, buff=0.5,
+            duration=600, dialogue="In the name of Dharma, I shall not fall!",
+            desc="Power of truth — heals 40 HP and boosts damage by 50%."),
+        "SHAKUNI": dict(
+            name="MAYA CHAKRA", damage=30, kind="illusion_storm",
+            color=(120, 235, 120), unblockable=False, copies=5, scramble_ms=5000,
+            dialogue="The dice have decided your fate!",
+            desc="Five illusion copies strike at once and scramble your inputs."),
+    }
+    DEFAULT_ULTIMATE = dict(
+        name="DIVINE WRATH", damage=45, kind="radial_shock",
+        color=GOLD, unblockable=False, dialogue="THIS ENDS YOU!",
+        desc="A surge of raw divine fury.")
+
+    @classmethod
+    def get_ultimate(cls, name):
+        """Fetch this warrior's ultimate recipe (safe fallback)."""
+        return cls.ULTIMATES.get(name, cls.DEFAULT_ULTIMATE)
+
+    # ---- STEP 2: passive abilities ------------------------------------
+    def _passive(self, tag, default):
+        """Look up a passive multiplier / flag for this warrior."""
+        p = {
+            # ARJUNA  : +10% astral meter from attacks
+            "meter_gain": {"ARJUNA": 1.10}.get(self.name, 1.0),
+            # KARNA   : Kavach-Kundal — takes 20% less damage
+            "damage_taken": {"KARNA": 0.80}.get(self.name, 1.0),
+            # BHIMA   : +15% punch/kick damage
+            "melee_damage": {"BHIMA": 1.15}.get(self.name, 1.0),
+            # YUDHISHTHIRA : blocks 30% harder than everyone else
+            "block_reduction": {"YUDHISHTHIRA": 1.30}.get(self.name, 1.0),
+            # DRONA   : projectiles fly 50% faster
+            "proj_speed": {"DRONACHARYA": 1.50}.get(self.name, 1.0),
+            # ABHIMANYU : 20% faster movement
+            "speed": {"ABHIMANYU": 1.20}.get(self.name, 1.0),
+        }
+        return p.get(tag, default)
+
+    @property
+    def effective_speed(self):
+        """Movement speed after the character's passive bonus."""
+        return self.speed * self._passive("speed", 1.0)
+
+    def passive_dodge_roll(self):
+        """SHAKUNI: 25% chance to slip any incoming blow entirely."""
+        if self.name != "SHAKUNI" or self.state == "ko":
+            return False
+        return random.random() < 0.25
+
+    def stun_immune(self):
+        """ASHWATTHAMA: the cursed immortal shrugs off all stun effects."""
+        return self.name == "ASHWATTHAMA"
+
+    def block_reduction(self):
+        """Fraction of damage absorbed while guarding (Yudhishthira +30%)."""
+        return min(0.95, self.BLOCK_REDUCTION *
+                   self._passive("block_reduction", 1.0))
+
+    def damage_boost(self):
+        """Extra melee damage multiplier from active ultimates/buffs
+        (Bhishma's ICCHA MRITYU doubles output, Yudhishthira +50%)."""
+        mult = self._passive("melee_damage", 1.0)
+        u = self.ult_active
+        if u and u["kind"] == "invincible_buff":
+            mult *= 2.0
+        if u and u["kind"] == "heal_buff":
+            mult *= 1.0 + u.get("buff", 0.0)
+        return mult
+
+    def invincible(self):
+        """True while Bhishma's ICCHA MRITYU keeps him untouchable."""
+        u = self.ult_active
+        return bool(u and u["kind"] == "invincible_buff")
+
+    # ---- ULTIMATE readiness / activation ------------------------------
+    def can_use_ultimate(self):
+        """Conditions: HP < 30%, astral meter full, off cooldown, alive.
+        Karna's Vasavi Shakti may only be used ONCE per match."""
+        try:
+            if self.health <= 0 or self.state == "ko":
+                return False
+            if self.ult_active is not None or self.is_channeling:
+                return False
+            if self.ultimate_cooldown > 0:
+                return False
+            if self.special_meter < 100:
+                return False
+            if self.max_health > 0 and \
+                    self.health > self.max_health * self.ULT_HP_THRESHOLD:
+                return False
+            ult = self.get_ultimate(self.name)
+            if ult.get("once_per_match") and self.ultimate_used:
+                return False
+            return self.state in ("idle", "walk", "crouch", "jump")
+        except Exception:                      # never crash mid-fight
+            return False
+
+    def start_ultimate(self, opponent=None, fx=None):
+        """Unleash the ULTIMATE ABILITY. Returns True on success.
+
+        Drains the astral meter, arms super armour through the cast,
+        spawns 100+ particles, screen flash/shake/tint and hands the
+        fight scene a slow-mo + camera-zoom request via `ult_active`."""
+        try:
+            if not self.can_use_ultimate():
+                return False
+            ult = self.get_ultimate(self.name)
+            if fx is None:
+                fx = ParticleSystem()
+            self.special_meter = 0.0
+            self.ultimate_meter = 0.0
+            self.ultimate_ready = False
+            self.ultimate_used = True if ult.get("once_per_match") \
+                else self.ultimate_used
+            self.ultimate_cooldown = self.ULT_COOLDOWN_FRAMES
+            play_sound("special_" + self.name.lower())
+            play_sound("ko")                   # heavy impact sting
+            # dramatic freeze + zoom handled by the fight scene reading
+            # ult_active["frames"]; here we just arm the channel window.
+            self.state = "punch"
+            self.attack_total = self.ULT_CAST_FRAMES
+            self.state_timer = self.ULT_CAST_FRAMES
+            self._cast_frames = self.ULT_CAST_FRAMES
+            self.attack_hit = True
+            self.is_channeling = True
+            foot_y = GROUND_Y - self.y
+            cx, cy = self.x, foot_y - 100
+            fx.create_divine_burst(cx, cy, ult["color"], count=60)
+            fx.spawn(cx, cy, GOLD, count=45, speed=9, life=40, size=6,
+                     ptype="divine")
+            fx.flash(10)
+            fx.shake(30, 14)
+            fx.tint(ult["color"], 26)
+            fx.freeze(8)
+            self.ult_active = {
+                "kind": ult["kind"], "name": ult["name"],
+                "damage": ult["damage"], "color": ult["color"],
+                "unblockable": ult.get("unblockable", False),
+                "hits": ult.get("hits", 1), "interval": ult.get("interval", 8),
+                "duration": ult.get("duration", 0),
+                "heal": ult.get("heal", 0), "buff": ult.get("buff", 0.0),
+                "splash": ult.get("splash", 0),
+                "copies": ult.get("copies", 0),
+                "scramble_ms": ult.get("scramble_ms", 0),
+                "life": ult.get("duration", 0) or 90,
+                "timer": self.ULT_CAST_FRAMES,   # delay before first hit
+                "next_hit": self.ULT_CAST_FRAMES,
+                "hit_count": 0,
+                "x": float(self.x), "y": float(foot_y),
+                "target_x": float(opponent.x) if opponent else float(self.x),
+                "zoom": 1.0,
+            }
+            # Buff-type ultimates resolve instantly (no travelling hitbox)
+            if ult["kind"] in ("invincible_buff", "heal_buff"):
+                self._resolve_buff_ultimate(opponent, fx)
+            elif ult["kind"] == "cosmic_beam":
+                self._ult_instant_strike(opponent, ult["damage"], fx,
+                                         unblockable=True)
+            elif ult["kind"] == "spear":
+                self.projectiles.append(self._make_projectile(
+                    self.x + self.facing * 40, foot_y - 110,
+                    dx=self.facing * 22 * self._passive("proj_speed", 1.0),
+                    damage=ult["damage"], shape="spear", scale=1.6))
+            elif ult["kind"] == "fireball":
+                self.projectiles.append(self._make_projectile(
+                    self.x + self.facing * 40, foot_y - 100,
+                    dx=self.facing * 12 * self._passive("proj_speed", 1.0),
+                    damage=ult["damage"], shape="fireball", scale=1.8))
+            elif ult["kind"] == "radial_shock":
+                self._ult_radial(opponent, ult, fx)
+            elif ult["kind"] == "aoe_slam":
+                self._ult_slam(opponent, ult, fx)
+            elif ult["kind"] == "illusion_storm":
+                self._ult_illusion_storm(opponent, ult, fx)
+            return True
+        except Exception as exc:               # STEP 6: never crash
+            print(f"[ultimate-guard] {self.name}: {exc!r}")
+            return False
+
+    # ---- individual ultimate resolvers --------------------------------
+    def _ult_instant_strike(self, opponent, dmg, fx, unblockable=False):
+        """Strike the foe immediately (used by beams / multi-hits)."""
+        if opponent is None or opponent.state == "ko":
+            return 0
+        if not unblockable and opponent.passive_dodge_roll():
+            fx.add_spark(opponent.x, GROUND_Y - opponent.y - 100, 12, WHITE)
+            return 0
+        applied = opponent.take_hit(dmg, self)
+        self._ult_credit.append(applied)
+        fx.create_hit_sparks(opponent.x, GROUND_Y - opponent.y - 100,
+                             self.get_ultimate(self.name)["color"], count=20)
+        return applied
+
+    def _ult_radial(self, opponent, ult, fx):
+        """RUDRA TANDAV — eight-way shockwave; ground/air both covered."""
+        for ang in range(0, 360, 45):
+            r = math.radians(ang)
+            fx.emit(self.x, GROUND_Y - self.y - 60,
+                    math.cos(r) * 10, math.sin(r) * 10,
+                    ult["color"], 34, 7, 0.05, "energy")
+        fx.shake(26, 13)
+        dist = abs(opponent.x - self.x) if opponent else 9999
+        if opponent is not None and dist < 260:
+            total = ult["damage"] // max(1, ult.get("hits", 1))
+            for _ in range(ult.get("hits", 1)):
+                self._ult_instant_strike(opponent, total, fx)
+
+    def _ult_slam(self, opponent, ult, fx):
+        """GADA PRALAYA — leap + massive AOE ring at the landing spot."""
+        self.vy = 14
+        self.y = max(self.y, 1)
+        fx.shake(30, 16)
+        if opponent is not None and abs(opponent.x - self.x) < 220:
+            self._ult_instant_strike(opponent, ult["damage"], fx)
+
+    def _ult_illusion_storm(self, opponent, ult, fx):
+        """MAYA CHAKRA — copies + scrambled controls + combined damage."""
+        if opponent is not None:
+            opponent.controls_reversed_until = \
+                pygame.time.get_ticks() + ult.get("scramble_ms", 5000)
+            self._ult_instant_strike(opponent, ult["damage"], fx)
+        fx.tint((40, 200, 90), 40)
+
+    def _resolve_buff_ultimate(self, opponent, fx):
+        """Instant self-buff ultimates (ICCHA MRITYU / SATYA VACHAN)."""
+        u = self.ult_active
+        if u["kind"] == "heal_buff":
+            self.health = min(self.max_health, self.health + u["heal"])
+            self.display_health = float(self.health)
+            fx.spawn(self.x, GROUND_Y - self.y - 120, GOLD, count=50,
+                     speed=4, life=50, size=6, ptype="divine")
+        u["timer"] = 0          # buffs live purely off their duration
+
+    def _update_ultimate(self):
+        """Per-frame upkeep: readiness flag, cooldown, timed multi-hits."""
+        self.ultimate_ready = self.can_use_ultimate() or \
+            (self.ultimate_cooldown == 0 and self.special_meter >= 100 and
+             0 < self.health <= self.max_health * self.ULT_HP_THRESHOLD)
+        # Ultimate meter mirrors the gate so the HUD third bar can show
+        # progress: 0 -> partial meter, 100 -> conditions satisfied.
+        if self.special_meter >= 100 and \
+                self.health <= self.max_health * self.ULT_HP_THRESHOLD:
+            self.ultimate_meter = 100.0
+        else:
+            hp_part = 0.0
+            if self.health <= self.max_health * self.ULT_HP_THRESHOLD:
+                hp_part = 50.0
+            self.ultimate_meter = hp_part + (self.special_meter / 100.0) * 50.0
+        if self.ultimate_cooldown > 0:
+            self.ultimate_cooldown -= 1
+        # Bhishma: regenerates 1 HP per second (passive)
+        if self.name == "BHISHMA PITAMAH" and 0 < self.health < self.max_health:
+            self.passive_timer += 1
+            if self.passive_timer >= 60:
+                self.passive_timer = 0
+                self.health = min(self.max_health, self.health + 1)
+        u = self.ult_active
+        if u is None:
+            return
+        u["life"] -= 1
+        u["timer"] -= 1
+        u["x"] = self.x
+        u["y"] = GROUND_Y - self.y
+        u["target_x"] = u.get("target_x", self.x)
+        # ---- timed multi-hit ultimates (ABHIMANYU / ASHWATTHAMA) ------
+        if u["kind"] in ("multi_hit", "arrow_rain") and \
+                u["timer"] <= u["next_hit"]:
+            opp = getattr(self, "_ult_opponent", None)
+            if opp is not None and opp.state != "ko" and u["life"] > 0:
+                fx = self.fx or ParticleSystem()
+                if u["kind"] == "multi_hit":
+                    self._ult_instant_strike(opp, u["damage"], fx)
+                    u["color_trail"] = True
+                else:
+                    ax = opp.x + random.uniform(-40, 40)
+                    fy = GROUND_Y - opp.y - 100
+                    if random.random() < 0.7:
+                        self._ult_instant_strike(opp, u["damage"], fx)
+                    fx.spawn(ax, 0, (255, 120, 60), count=6, speed=6,
+                             life=20, size=4, gravity=0.6, ptype="fire")
+                    fx.add_spark(ax, fy, 12, u["color"])
+                u["hit_count"] += 1
+                u["next_hit"] = u["timer"] + u["interval"]
+                if u["hit_count"] >= u["hits"]:
+                    u["life"] = min(u["life"], 20)
+        if u["kind"] in ("invincible_buff", "heal_buff") and u["life"] <= 0:
+            self.ult_active = None
+        elif u["life"] <= 0:
+            self.ult_active = None
+
+    def clear_ultimate(self):
+        """Drop all ultimate state (round reset / new bout)."""
+        self.ult_active = None
+        self._ult_credit.clear()
+        self.ultimate_cooldown = 0
+        self.ultimate_ready = False
 
     # ---------- combat: receiving damage ----------
     def take_hit(self, dmg, attacker=None):
@@ -1609,10 +2019,26 @@ class Fighter:
         if self.state == "ko":
             return 0
         facing_in = attacker.facing if attacker is not None else self._last_attacker_facing(attacker)
-        blocked = (self.state == "block") or \
-                  (self.state == "crouch" and attacker is not None and
-                   abs(self.x - attacker.x) < 140 and
-                   attacker.state == "kick")   # crouching ducks punches
+        # ---- ULTIMATE ABILITY SYSTEM: incoming-damage passives ------
+        # Bhishma's ICCHA MRITYU makes every blow bounce off; Shakuni's
+        # cunning slips 25% of all attacks entirely; an unblockable
+        # ultimate (Pashupatastra etc.) simply ignores the guard.
+        unblockable = bool(getattr(attacker, "_ult_unblockable", False)) \
+            if attacker is not None else False
+        if self.invincible():          # ICCHA MRITYU: blows bounce off
+            if self.fx is not None:
+                self.fx.add_spark(self.x, GROUND_Y - self.y - 100,
+                                  10, WHITE)
+            return 0
+        if self.passive_dodge_roll():
+            if self.fx is not None:
+                self.fx.create_hit_sparks(self.x, GROUND_Y - self.y - 100,
+                                          WHITE, count=8)
+            return 0
+        blocked = ((self.state == "block") or
+                   (self.state == "crouch" and attacker is not None and
+                    abs(self.x - attacker.x) < 140 and
+                    attacker.state == "kick")) and not unblockable
 
         chest_y = GROUND_Y - self.y - 100      # impact point for fx
 
@@ -1626,16 +2052,30 @@ class Fighter:
             blocked = False
 
         if blocked:
-            applied = max(1, int(round(dmg * (1.0 - self.BLOCK_REDUCTION))))
+            applied = max(1, int(round(dmg * (1.0 - self.block_reduction()))))
             self.health = max(0, self.health - applied)
             self.block_stun = self.BLOCK_STUN_FRAMES      # 10 frozen frames
             self.vx = facing_in * 3                        # small push-back
+            play_sound("block")                            # SOUND TRIGGER
             if self.fx is not None:                        # gold guard sparks
                 self.fx.create_hit_sparks(self.x + facing_in * 30,
                                           chest_y, GOLD, count=8)
             return applied
 
+        # ---- SOUND TRIGGERS: impact cue for the incoming blow ----------
+        # punch/kick sounds fire where the attack lands (FightState);
+        # astral projectiles and instant specials announce themselves with
+        # their per-character cue; everything that bleeds HP also plays
+        # the generic "hit" thud.
+        if getattr(attacker, "_special_credit", None) or \
+                getattr(attacker, "is_channeling", False):
+            play_sound("special_" + attacker.name.lower())
+        play_sound("hit")
+
         applied = int(dmg)
+        # PASSIVE: Karna's Kavach-Kundal absorbs 20% of all incoming harm
+        applied = max(1, int(round(applied *
+                                   self._passive("damage_taken", 1.0))))
         self.health = max(0, self.health - applied)
         # SPECIAL METER also charges while RECEIVING damage (comeback astras)
         self.special_meter = min(100.0,
@@ -1659,6 +2099,7 @@ class Fighter:
             self.state_timer = 0
             self.vx = facing_in * 7
             self.vy = 4                                    # dramatic pop-up
+            play_sound("ko")                               # SOUND TRIGGER
             if self.fx is not None:                        # KO spectacle
                 self.fx.flash(FLASH_FRAMES + 2)
                 self.fx.shake(24, 12)
@@ -1676,6 +2117,10 @@ class Fighter:
                 if self.fx is not None:
                     self.fx.create_hit_sparks(self.x + facing_in * 26,
                                               chest_y, GOLD, count=10)
+            elif self.stun_immune():
+                # PASSIVE: Ashwatthama never flinches — only pushed back
+                self.vx = facing_in * 3
+                self.vy = 0
             else:
                 self.state = "hurt"                            # hit stun
                 self.state_timer = self.HIT_STUN
@@ -1728,11 +2173,18 @@ class Fighter:
             self.vy -= GRAVITY * 0.6          # knockback lift falls sooner
             self.y += self.vel_y + self.vy
             if self.y <= 0:                   # touched down on the ground
+                landed_high = self._prev_y    # height before this step
                 self.y, self.vel_y, self.vy = 0.0, 0.0, 0.0
                 if self.state == "jump":
                     self.state = "idle"
                 if self.fx is not None:       # landing dust puff
                     self.fx.create_ground_dust(self.x, GROUND_Y - 4)
+                # SOUND TRIGGER: fighter lands after a real jump -> thud.
+                # (Only fires when they were genuinely airborne, so round
+                #  resets and spawn snaps stay silent.)
+                if landed_high > 24.0:
+                    play_sound("jump")
+        self._prev_y = self.y
         self.was_airborne = airborne
 
     def _emit_fx(self):
@@ -1749,8 +2201,41 @@ class Fighter:
             tip_y = foot_y - (112 if self.state == "punch" else 60)
             fx.create_weapon_trail(tip_x, tip_y, self.special_color)
 
+    def _sync_flags(self):
+        """Keep the boolean pose flags mirrored with `self.state`.
+
+        The engine's single source of truth is the string state machine;
+        these flags exist so every consumer (HUD, AI brain, drawing and
+        any future code) can read a plain bool without risking an
+        AttributeError or desync.  Called first thing every frame.
+        """
+        s = self.state
+        self.is_punching = (s == "punch")
+        self.is_kicking = (s == "kick")
+        self.is_hit = (s == "hurt")
+        self.is_blocking = (s == "block")
+        self.is_crouching = (s == "crouch")
+        self.is_jumping = (self.y < 0)
+        self.on_ground = (self.y >= 0)
+        self.is_special = bool(self.is_channeling or self.vortex
+                               or self.beam_fx or self.pillar_fx
+                               or self.teleport_fx or self.illusion_fx)
+        # compatibility aliases used by older call-sites
+        self.attack_timer = self.state_timer
+        self.hit_timer = self.hit_flash
+        self.special_timer = getattr(self, "_cast_frames", 0)
+        self.anim_frame = int(self.anim_time) % 360
+        # stun budget = whatever locks this fighter right now
+        self.stun_timer = max(self.state_timer if s == "hurt" else 0,
+                              self.block_stun, self.extra_stun)
+        if self.dodge_timer > 0:
+            self.dodge_timer -= 1
+
     def update(self, opponent):
         """One simulation step for this fighter (called once per frame)."""
+        self._sync_flags()          # BUG-FIX: flags always fresh & defined
+        # ---- ULTIMATE ABILITY SYSTEM per-frame upkeep ----
+        self._update_ultimate()
         # --- jump / gravity physics ---
         self.apply_gravity()
 
@@ -1807,7 +2292,13 @@ class Fighter:
         self._emit_fx()
 
         # --- AI control for player-less fighters ---
-        if self.controls is None and opponent is not None:
+        # When a professional AIController/AIBrain is attached it owns the
+        # fighter (virtual-key intents injected by FightState), so skip the
+        # legacy built-in brain to avoid double-driving.  The old simple
+        # update_ai() fallback still runs only for fighters with NO brain
+        # at all (e.g. headless demos).
+        if self.controls is None and opponent is not None \
+                and getattr(self, "brain", None) is None:
             self.update_ai(opponent)
 
     # ---------- combo bookkeeping (used by the fight scene) ----------
@@ -1829,7 +2320,9 @@ class Fighter:
         """Damage system: attacker charges the astral meter at 1.5x the
         damage actually dealt (capped at 100)."""
         self.special_meter = min(100.0,
-                                 self.special_meter + dmg * self.METER_GAIN)
+                                 self.special_meter +
+                                 dmg * self.METER_GAIN *
+                                 self._passive("meter_gain", 1.0))
 
     # ------------------------------------------------------------------
     # SPECIAL MOVES SYSTEM — per-frame upkeep for lingering astral fx
@@ -2198,6 +2691,51 @@ class Fighter:
         draw_centered_text(target, label, FONT_SMALL, WHITE, cx,
                            foot_y - STAND_HEIGHT - 38, shadow=True)
 
+    def _draw_character_aura(self, target):
+        """CHARACTER-SPECIFIC AURA — each warrior radiates their own sign:
+          Arjuna : blue energy wisps      Karna : golden sun rays
+          Bhima  : red rage steam         Ashwatthama : dark-red gem glow
+        Drawn behind the body so it reads as an emanation, not a sticker."""
+        if self.state == "ko":
+            return
+        cx = int(self.x)
+        cy = int(GROUND_Y - self.y) - 95
+        t = self.anim_time
+        col = self.special_color
+        try:
+            if self.name == "ARJUNA":                 # blue wisps
+                for i in range(3):
+                    a = t * 0.06 + i * 2.1
+                    wx = cx + math.cos(a) * 34
+                    wy = cy + math.sin(a * 1.7) * 46
+                    _glow(target, wx, wy, 10, (60, 120, 255), 90)
+            elif self.name == "KARNA":                # golden sun rays
+                for i in range(8):
+                    a = t * 0.02 + i * math.tau / 8
+                    x2 = cx + math.cos(a) * (52 + 6 * math.sin(t * 0.1 + i))
+                    y2 = cy + math.sin(a) * (52 + 6 * math.sin(t * 0.1 + i))
+                    pygame.draw.line(target, (255, 210, 90),
+                                     (cx + math.cos(a) * 30,
+                                      cy + math.sin(a) * 30), (x2, y2), 2)
+            elif self.name == "BHIMA":                # red rage steam
+                for i in range(4):
+                    rise = (t * 1.4 + i * 26) % 90
+                    sx = cx + math.sin((t + i * 30) * 0.08) * 16
+                    alpha = max(0, int(110 - rise * 1.2))
+                    if alpha:
+                        g = pygame.Surface((26, 26), pygame.SRCALPHA)
+                        pygame.draw.circle(g, (200, 60, 40, alpha),
+                                           (13, 13), 10)
+                        target.blit(g, (int(sx) - 13, int(cy + 40 - rise)))
+            elif self.name == "ASHWATTHAMA":          # forehead gem
+                pulse = 0.5 + 0.5 * math.sin(t * 0.15)
+                gy = int(GROUND_Y - self.y) - 148
+                _glow(target, cx, gy, int(8 + 5 * pulse), (220, 30, 30),
+                      int(140 + 80 * pulse))
+                pygame.draw.circle(target, (255, 70, 60), (cx, gy), 4)
+        except Exception as exc:                       # never crash render
+            print(f"[aura-guard] {self.name}: {exc!r}")
+
     def draw(self, target):
         """Draw the warrior, honouring the cinematic `draw_scale`.
 
@@ -2205,6 +2743,8 @@ class Fighter:
         zoom-in; we render the body onto a transparent canvas and scale
         it about the fighter's FEET so the camera push-in never lifts or
         sinks the character off the ground line."""
+        # ---- CHARACTER-SPECIFIC AURA (polish feature 8) --------------
+        self._draw_character_aura(target)
         s = float(getattr(self, "draw_scale", 1.0))
         if abs(s - 1.0) < 0.004:
             self._draw_body(target)
@@ -2223,6 +2763,31 @@ class Fighter:
         dx = int((pad_x + fx) * (1.0 - s))
         dy = int((pad_top + fy) * (1.0 - s))
         target.blit(zoomed_canvas, (dx, dy))
+
+    # ------------------------------------------------------------------
+    # AI VISUAL INDICATOR (spec STEP 5): small "CPU" tag above the head
+    # with a pulsing gold/red dot so you can see who the machine drives.
+    # Drawn OUTSIDE the zoom canvas so it never scales during cutscenes.
+    # ------------------------------------------------------------------
+    def draw_ai_tag(self, target):
+        if getattr(self, "brain", None) is None or self.state == "ko":
+            return
+        cx = int(self.x)
+        head_y = int(GROUND_Y - self.y) - 138     # just above the crown
+        pulse = 0.5 + 0.5 * math.sin(self.anim_time * 0.12)
+        col = (255, 90, 60) if pulse > 0.5 else GOLD   # red/gold heartbeat
+        tag = FONT_TINY.render("CPU", True, col)
+        tw = tag.get_width()
+        bg = pygame.Surface((tw + 10, tag.get_height() + 4), pygame.SRCALPHA)
+        bg.fill((10, 6, 4, 170))
+        pygame.draw.rect(bg, (*col, 220), bg.get_rect(), 1, border_radius=3)
+        target.blit(bg, (cx - (tw + 10) // 2, head_y - 14))
+        target.blit(tag, (cx - tw // 2, head_y - 12))
+        # blinking activity dot — brighter the harder the difficulty
+        lvl = getattr(self.brain, "level", "MEDIUM")
+        r = {"EASY": 2, "MEDIUM": 3, "HARD": 4}.get(lvl, 3)
+        if pulse > 0.35:
+            pygame.draw.circle(target, col, (cx + tw // 2 + 8, head_y - 5), r)
 
 
 # =====================================================================
@@ -2545,14 +3110,11 @@ P1_KEYS = {
     pygame.K_z:      "punch",      # fast, low damage  (20-frame cooldown)
     pygame.K_x:      "kick",       # medium, more dmg + longer range (25f)
 }
-P2_KEYS = {
-    pygame.K_i:      "up",         # I J K L layout: I=jump
-    pygame.K_j:      "left",
-    pygame.K_k:      "down",       # crouch / block-with-back
-    pygame.K_l:      "right",
-    pygame.K_b:      "punch",      # B = punch
-    pygame.K_n:      "kick",       # N = kick
-}
+# NOTE (OVERHAUL STEP 2): local 2-player mode has been REMOVED.
+# The right-hand fighter is ALWAYS AI-controlled, so there is no human
+# P2 keymap any more — only the CPU's virtual intents drive that slot.
+P2_KEYS = {}                      # kept as an empty dict for compatibility
+
 
 
 # =====================================================================
@@ -3399,6 +3961,366 @@ class AIBrain:
         self.held = held
 
 
+# ---------------------------------------------------------------------
+# AIController — PROFESSIONAL wrapper around AIBrain (per spec STEP 1)
+# ---------------------------------------------------------------------
+# The spec asks for a class taking (fighter, opponent, difficulty).  It
+# extends AIBrain with the four-zone distance model, HP-driven behaviour
+# phases, optimal-range special usage and the direct-action API
+# (move_left / move_right / jump / crouch / punch / kick / block /
+# use_special).  Everything still funnels through .held virtual keys so
+# the CPU uses the identical input pipeline as the human player.
+AI_ZONES = {
+    "very_far": 400.0,     # >400px : walk toward player, occasional dash
+    "far":      200.0,     # 200-400: cautious approach, prepare to strike
+    "medium":   100.0,     # 100-200: jump in / ranged specials
+    # <100px is the CLOSE zone: attack, combo or block
+}
+AI_HP_PHASES = {"aggressive": 70.0, "balanced": 30.0}   # % of max health
+AI_REACTION_DELAYS = {"EASY": 30, "MEDIUM": 15, "HARD": 5}   # frames
+AI_ATTACK_CHANCE = {"EASY": 0.40, "MEDIUM": 0.60, "HARD": 0.80}
+AI_BLOCK_CHANCE = {"EASY": 0.20, "MEDIUM": 0.50, "HARD": 0.75}
+
+
+class AIController(AIBrain):
+    """Professional AI opponent: distance zones + HP phases + personas.
+
+    Difficulty profiles follow the spec exactly:
+      EASY   reaction delay 30f, attacks 40%, blocks 20%
+      MEDIUM reaction delay 15f, attacks 60%, blocks 50%, uses specials
+      HARD   reaction delay  5f, attacks 80%, blocks 75%, perfect specials
+    """
+
+    def __init__(self, fighter, opponent, difficulty="MEDIUM"):
+        super().__init__(fighter, opponent, difficulty)
+        self.difficulty = self.level          # spec-friendly alias
+        # ---- spec timing knobs ------------------------------------
+        self.reaction_delay = AI_REACTION_DELAYS.get(self.level, 15)
+        self.attack_chance = AI_ATTACK_CHANCE.get(self.level, 0.60)
+        self.block_chance = AI_BLOCK_CHANCE.get(self.level, 0.50)
+        # cadence: one decision every reaction_delay frames (min 5f)
+        self.DECIDE_EVERY = max(5, self.reaction_delay // 3)
+        # HARD gets near-perfect special play (fires whenever it can)
+        if self.level == "HARD":
+            self.p["special_bias"] = 1.6
+            self.p["combo_max"] = 4
+        elif self.level == "EASY":
+            self.p["special_bias"] = 0.5      # wastes/forgets astras
+        # ---- plan bookkeeping ---------------------------------------
+        self.dash_timer = 0                   # frames of dash left
+        self.cautious_timer = 0               # far-zone pacing counter
+        self.last_zone = ""                   # debug / telemetry
+        self.last_phase = "normal"
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    def _zone(self):
+        """Four-band distance check (spec STEP 2.1)."""
+        d = self._distance()
+        if d > AI_ZONES["very_far"]:
+            return "very_far"
+        if d > AI_ZONES["far"]:
+            return "far"
+        if d > AI_ZONES["medium"]:
+            return "medium"
+        return "close"
+
+    def _hp_percent(self):
+        f = self.fighter
+        try:
+            return max(0.0, min(100.0, 100.0 * f.health / max(1, f.max_health)))
+        except Exception:                     # never crash mid-fight
+            return 100.0
+
+    def _phase(self):
+        """HP-based behaviour mode (spec STEP 2.3)."""
+        hp = self._hp_percent()
+        if hp > AI_HP_PHASES["aggressive"]:
+            return "normal"                    # healthy: standard pressure
+        if hp >= AI_HP_PHASES["balanced"]:
+            return "balanced"                  # midway: mix it up + astras
+        return "desperate"                     # <30%: all-or-nothing rush
+
+    def _optimal_range(self):
+        """Range where THIS warrior's astral actually lands."""
+        kind = getattr(getattr(self.fighter, "astra", None), "get",
+                       lambda *_: None)("kind") \
+            if isinstance(getattr(self.fighter, "astra", None), dict) else None
+        name = getattr(self.fighter, "name", "")
+        if kind in ("projectile", "barrage", "disc", "beam"):
+            return 180.0, 520.0                # archers: fire from mid range
+        if "SHAKUNI" in name:
+            return 120.0, 360.0                # trap works at arm's length+
+        if "ABHIMANYU" in name:
+            return 0.0, 120.0                  # vortex needs to be on top
+        return 0.0, 170.0                      # mace/sword melee astras
+
+    def _player_is_dodging(self):
+        o = self.opponent
+        return (o.y < -20 or o.state in ("crouch", "jump")
+                or getattr(o, "dodge_timer", 0) > 0)
+
+    def _player_blocking(self):
+        o = self.opponent
+        return o.state == "block" or getattr(o, "is_blocking", False)
+
+    def _player_hurt(self):
+        o = self.opponent
+        return (getattr(o, "is_hit", False) or o.state == "hurt"
+                or getattr(o, "stun_timer", 0) > 0
+                or getattr(o, "hit_flash", 0) > 6)
+
+    # ------------------------------------------------------------------
+    # DIRECT ACTION API (spec STEP 4)
+    # Every helper adds a small random delay so the CPU never feels like
+    # a metronome; intents still flow through .held -> _apply_ai_input.
+    # ------------------------------------------------------------------
+    def move_left(self):
+        self.held.add("left")
+        self.idle_timer = 0
+
+    def move_right(self):
+        self.held.add("right")
+        self.idle_timer = 0
+
+    def move_toward_player(self):
+        if self.opponent.x < self.fighter.x:
+            self.move_left()
+        else:
+            self.move_right()
+
+    def back_off(self):
+        if self.opponent.x < self.fighter.x:
+            self.move_right()
+        else:
+            self.move_left()
+
+    def dash(self):
+        """Short burst sprint used in the very-far band."""
+        self.dash_timer = random.randint(8, 14)
+        self.move_toward_player()
+
+    def jump(self):
+        self.held.add("up")
+
+    def crouch(self):
+        self.held.add("down")
+
+    def punch(self):
+        self.held.add("punch")
+        self.idle_timer = random.randint(0, 6)     # human-ish follow-up gap
+
+    def kick(self):
+        self.held.add("kick")
+        self.idle_timer = random.randint(2, 9)
+
+    def anti_air(self):
+        """Uppercut-style answer to a leaping opponent: rising kick."""
+        self.kick()
+
+    def block(self):
+        back = "left" if self.fighter.facing > 0 else "right"
+        self.held.update(("down", back))
+
+    def use_special(self):
+        self.held.add("special")
+        self.idle_timer = random.randint(14, 30)   # recover after the cast
+
+    def throw_or_backoff(self):
+        """Vs a blocking player: close in with a heavy kick (grab-ish) or
+        step out — chosen by personality roll."""
+        if random.random() < 0.55:
+            self.plan.append(("kick", 4))           # armour-breaking habit
+        else:
+            self.back_off()
+
+    # ------------------------------------------------------------------
+    # main per-frame brain (spec STEP 2)
+    # ------------------------------------------------------------------
+    def _decide(self):
+        f, o = self.fighter, self.opponent
+        p = self.p
+        dist = self._distance()
+        zone = self._zone()
+        phase = self._phase()
+        self.last_zone, self.last_phase = zone, phase
+        actions = []
+
+        # desperate mode overrides hesitation entirely
+        if phase == "desperate":
+            self.idle_timer = 0
+
+        # ---- 2. PLAYER STATE AWARENESS (react first) ------------------
+        o_attacking = o.state in ("punch", "kick") and not o.attack_hit
+        o_special = getattr(o, "is_channeling", False)
+        o_jumping = o.y < -20
+        react_ok = self.frame % max(1, self.reaction_delay // 3) == 0
+
+        if o_special and random.random() < p["dodge"]:
+            # dodge the astra: hop backwards or duck under it
+            if random.random() < 0.5:
+                self.back_off()
+                self.jump()
+            else:
+                self.crouch()
+            return ["evade"]
+        if o_attacking and dist < 170 and react_ok \
+                and random.random() < self.block_chance:
+            self.block()
+            return ["block"]
+        if o_jumping and dist < 150 and react_ok \
+                and random.random() < p["antiair"]:
+            self.anti_air()
+            return ["antiair"]
+        if self._player_hurt() and dist < 130 and phase != "desperate" \
+                and random.random() < self.attack_chance + 0.2:
+            # punish window: queue a quick 2-4 hit combo
+            for _ in range(random.randint(2, p["combo_max"])):
+                self.plan.append((random.choice(("punch", "kick")), 4))
+            act, n = self.plan.pop(0)
+            (self.punch() if act == "punch" else self.kick())
+            return [act]
+        if self._player_blocking() and dist < 150 and react_ok:
+            self.throw_or_backoff()
+            return ["vs_block"]
+
+        # ---- queued combo still running? ------------------------------
+        if self.plan:
+            act, n = self.plan[0]
+            if act == "wait":
+                if n <= 1:
+                    self.plan.pop(0)
+                else:
+                    self.plan[0] = ("wait", n - 1)
+                return actions
+            actions.append(act)
+            if n <= 1:
+                self.plan.pop(0)
+            else:
+                self.plan[0] = (act, n - 1)
+            return actions
+
+        # ---- 4. SPECIAL USAGE (full meter AND optimal range) ----------
+        lo_rng, hi_rng = self._optimal_range()
+        if f.special_meter >= 100 and lo_rng <= dist <= hi_rng:
+            want = {"normal": 0.45, "balanced": 0.70,
+                    "desperate": 1.00}[phase] * p.get("special_bias", 1.0)
+            if self.level == "HARD":
+                want = 1.0 if phase == "desperate" else max(want, 0.8)
+            if not (self._player_is_dodging() and self.level != "HARD"
+                    and random.random() < 0.6):      # don't waste it
+                if random.random() < want:
+                    self.use_special()
+                    return ["special"]
+
+        # ---- 1. DISTANCE ZONES ----------------------------------------
+        if zone == "very_far":
+            self.move_toward_player()                 # close the gap
+            if random.random() < 0.12:
+                self.dash()                           # occasional dash-in
+            if random.random() < p["jump"] * 0.5:
+                self.jump()
+            actions.append("approach")
+        elif zone == "far":
+            # cautious prodding: step in, stop, re-read the player
+            self.cautious_timer += 1
+            if self.cautious_timer % 3 == 0:
+                self.move_toward_player()
+            elif random.random() < 0.25:
+                self.back_off()
+            if f.special_meter >= 100 and random.random() < 0.25:
+                self.use_special()
+                actions.append("special")
+            actions.append("caution")
+        elif zone == "medium":
+            # jump-ins and ranged pokes
+            if random.random() < p["approach"]:
+                self.move_toward_player()
+            if random.random() < p["jump"] * (1.6 if "ABHIMANYU"
+                                              in getattr(f, "name", "") else 1):
+                self.jump()
+                self.move_toward_player()
+            elif random.random() < 0.35 * self.attack_chance / 0.6:
+                actions.append(random.choice(("punch", "kick")))
+                self.punch() if actions[-1] == "punch" else self.kick()
+            actions.append("mixup")
+        else:  # close (<100px)
+            if phase == "desperate" and f.special_meter >= 100:
+                self.use_special()
+                return ["special_desperate"]
+            if self.idle_timer > 0 and phase != "desperate":
+                self.idle_timer -= self.DECIDE_EVERY
+                if random.random() < 0.30:
+                    self.block()
+                    actions.append("guard")
+            elif random.random() < self.attack_chance:
+                heavy = "BHIMA" in getattr(f, "name", "") or \
+                        "DURYODHANA" in getattr(f, "name", "")
+                for _ in range(random.randint(2, p["combo_max"])):
+                    pick = "kick" if (heavy and random.random() < 0.6) \
+                        else random.choice(("punch", "punch", "kick"))
+                    self.plan.append((pick, 4))
+                    l_, h_ = p["attack_gap"]
+                    self.plan.append(("wait", random.randint(3, 9)))
+                act, n = self.plan.pop(0)
+                actions.append(act)
+                (self.punch() if act == "punch" else self.kick())
+            else:
+                self.back_off()                       # space check
+                actions.append("retreat")
+        return actions
+
+    # ------------------------------------------------------------------
+    # 3. CHARACTER PERSONALITY (spec STEP 3) — richer than the base map
+    # ------------------------------------------------------------------
+    def _apply_personality(self):
+        name = getattr(self.fighter, "name", "")
+        p = self.p
+        if "BHIMA" in name:                # rage rusher, heavy swings
+            p["approach"], p["attack_bias_heavy"] = 0.97, True
+            lo, hi = p["attack_gap"]
+            p["attack_gap"] = (max(5, lo - 7), max(11, hi - 15))
+            p["special_bias"] = 1.3         # mace astra point-blank
+        elif "DURYODHANA" in name:         # aggressive mauler, taunts a lot
+            p["approach"] = 0.93
+            p["attack_bias_heavy"] = True
+            p["taunt"] = True
+        elif "ARJUNA" in name:             # zoner: keeps distance, spams astras
+            p["approach"] = 0.55
+            p["special_bias"] = 1.6
+            p["jump"] = max(p["jump"], 0.18)     # tactical hops
+        elif "KARNA" in name:              # balanced, banks the meter
+            p["special_bias"] = 0.85
+            p["patience"] = True
+        elif "BHISHMA" in name:            # defensive counter-puncher
+            p["block"] = min(0.95, p["block"] + 0.2)
+            p["approach"] = 0.5
+            p["special_bias"] = 1.1
+        elif "ABHIMANYU" in name:          # leaping whirlwind
+            p["jump"] = 0.32
+            p["approach"] = 0.9
+            p["attack_gap"] = (5, 12)
+            p["special_bias"] = 1.2
+        elif "DRONACHARYA" in name:        # patient, calculated, long range
+            p["approach"] = 0.5
+            p["attack_gap"] = tuple(c + 6 for c in p["attack_gap"])
+            p["special_bias"] = 1.25
+        elif "ASHWATTHAMA" in name:        # unpredictable bursts
+            p["erratic"] = True
+            p["approach"] = 0.75
+            p["special_bias"] = 1.15
+        elif "YUDHISHTHIRA" in name:       # honourable: waits for openings
+            p["approach"] = 0.6
+            p["block"] = min(0.95, p["block"] + 0.1)
+            p["patient"] = True
+        elif "SHAKUNI" in name:            # trickster hit-and-run
+            p["approach"] = 0.4
+            p["block"] = min(0.95, p["block"] + 0.15)
+            p["hit_run"] = True
+            p["jump"] = max(p["jump"], 0.2)
+
+
 # =====================================================================
 # SECTION 6: GAME STATES (the state machine scenes)
 # =====================================================================
@@ -3448,6 +4370,8 @@ class GameState:
                 combo = f.register_hit(blocked=was_blocking)
                 if combo >= 2:
                     self.combo_pops.append((f, f"{combo} HIT COMBO!", 70))
+                if combo >= 3:                     # SOUND TRIGGER: combo 3+
+                    play_sound("combo")
                 self.hit_sparks.append((foe.x, GROUND_Y - foe.y - 100,
                                         16, f.special_color))
                 self.fx.spawn(foe.x, GROUND_Y - foe.y - 100,
@@ -3508,8 +4432,8 @@ class MenuState(GameState):
         MAHABHARAT          (huge pulsing gold)
         DIVINE WARFARE      (deep red below)
 
-        STORY MODE | 2 PLAYER BATTLE | VS AI
-        SETTINGS   | HOW TO PLAY     | QUIT
+        QUICK BATTLE | STORY MODE | SETTINGS
+        HOW TO PLAY  | EXIT
 
     Up/Down (or W/S) move the cursor, ENTER/SPACE activates, number keys
     1-6 jump straight to an entry.  Background: Kurukshetra sunset +
@@ -3518,14 +4442,14 @@ class MenuState(GameState):
     """
     name = STATE_MENU
 
-    OPTIONS = ("STORY", "2P", "AI", "SETTINGS", "HOWTO", "QUIT")
+    # OVERHAUL STEP 3: clean five-option menu (local 2-player removed).
+    OPTIONS = ("QUICK", "STORY", "SETTINGS", "HOWTO", "EXIT")
     LABELS = {
-        "STORY":    "\u2694  STORY MODE \u2014 the Mahabharat campaign",
-        "2P":       "\U0001F465 2 PLAYER BATTLE \u2014 local versus",
-        "AI":       "\U0001F916 VS AI \u2014 single player vs CPU",
-        "SETTINGS": "\u2699  SETTINGS \u2014 volume \u00b7 controls \u00b7 AI level",
-        "HOWTO":    "\U0001F4D6 HOW TO PLAY \u2014 controls & lore",
-        "QUIT":     "\U0001F6AA QUIT",
+        "QUICK":    "\u2694\uFE0F  QUICK BATTLE \u2014 pick your warrior, fight the CPU",
+        "STORY":    "\U0001F4DC  STORY MODE \u2014 the Mahabharat campaign",
+        "SETTINGS": "\u2699\uFE0F  SETTINGS \u2014 volume \u00b7 controls \u00b7 AI level",
+        "HOWTO":    "\U0001F4D6  HOW TO PLAY \u2014 controls & lore",
+        "EXIT":     "\U0001F6AA  EXIT",
     }
 
     def __init__(self, game):
@@ -3547,7 +4471,7 @@ class MenuState(GameState):
         key = self.OPTIONS[idx if idx is not None else self.sel]
         g = self.game
         play_sound("confirm")
-        if key == "QUIT":
+        if key == "EXIT":
             g.running = False                 # main loop closes gracefully
             return
         if key == "SETTINGS":
@@ -3558,14 +4482,14 @@ class MenuState(GameState):
             return
         if key == "STORY":
             g.game_mode = GAME_STORY
-            g.two_player = False
+            g.two_player = False              # story is always you vs CPU
             g.story_index = 0
             g.story_progress = 0
             g.change_state(STATE_STORY)
             return
-        # both versus flavors land on character select afterwards
+        # QUICK BATTLE: hero -> opponent -> difficulty -> fight vs CPU
         g.game_mode = GAME_VS
-        g.two_player = (key == "2P")
+        g.two_player = False                  # 2-player mode REMOVED
         g.change_state(STATE_CHARACTER_SELECT)
 
     def handle_event(self, event):
@@ -3578,9 +4502,9 @@ class MenuState(GameState):
         elif k in (pygame.K_DOWN, pygame.K_s):
             self.sel = (self.sel + 1) % len(self.OPTIONS)
             play_sound("select")
-        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
             self._activate()
-        elif pygame.K_1 <= k <= pygame.K_6:
+        elif pygame.K_1 <= k <= pygame.K_5:
             self._activate(k - pygame.K_1)
 
     # ------------------------------------------------------------------
@@ -3627,22 +4551,34 @@ class MenuState(GameState):
                            FONT_MEDIUM, WHITE, SCREEN_WIDTH // 2, 212,
                            shadow=True)
 
-        # ---- six options in two columns of three ------------------------
-        col_x = (SCREEN_WIDTH // 2 - 255, SCREEN_WIDTH // 2 + 255)
-        row_y = (272, 322, 372)
+        # ---- five options in one clean centered column ------------------
+        # OVERHAUL STEP 3: the selected entry glows GOLD and a small
+        # spinning dharma chakra sits beside it as the cursor emblem.
+        row_y = 262
+        row_gap = 44
         for i, key in enumerate(self.OPTIONS):
             sel = (i == self.sel)
-            c, r = i % 2, i // 2
             font = FONT_MEDIUM if sel else FONT_SMALL
             col = GOLD if sel else SAFFRON
-            prefix = "\u25BA  " if sel else "      "
+            prefix = "" if sel else "   "
             rect = draw_centered_text(target, prefix + self.LABELS[key],
-                                      font, col, col_x[c], row_y[r],
-                                      shadow=sel)
+                                      font, col, SCREEN_WIDTH // 2,
+                                      row_y + i * row_gap, shadow=sel)
             if sel:
+                # underline sweep
                 pygame.draw.line(target, SAFFRON,
                                  (rect.x - 10, rect.bottom + 4),
                                  (rect.right + 10, rect.bottom + 4), 2)
+                # small chakra icon just left of the highlighted label
+                draw_dharma_chakra(target, rect.x - 34,
+                                   rect.centery, 11, GOLD, spokes=8,
+                                   angle_offset=self.chakra_angle * 6)
+                # soft gold glow bar behind the row
+                glow = pygame.Surface((rect.width + 60, 34),
+                                      pygame.SRCALPHA)
+                glow.fill((*GOLD, 34))
+                target.blit(glow, (SCREEN_WIDTH // 2 - (rect.width + 60)
+                                   // 2, rect.centery - 17))
 
         # blinking classic prompt kept from v1
         if blink_visible(now - self.enter_time):
@@ -3918,24 +4854,19 @@ class HowToPlayState(GameState):
 
 
 class CharacterSelectState(GameState):
-    """CHOOSE YOUR WARRIOR — 5x2 card grid, dual-cursor selection.
+    """OVERHAUL STEP 4 — three-phase selection flow for QUICK BATTLE.
 
-    LAYOUT
-      * Gold title "CHOOSE YOUR WARRIOR" at the top
-      * 10 cards (5 columns x 2 rows); every card shows the character
-        name in their own colour, a mini drawn fighter preview, HP/SPD/PWR
-        stat bars, weapon name and the special-move name in special_color
-      * Dharma-chakra emblems decorate all four screen corners
-      * Bottom panel: description + dialogue quote of the hovered hero
+      PHASE 1  "CHOOSE YOUR WARRIOR"   - pick your hero (arrows + ENTER)
+      PHASE 2  "CHOOSE YOUR OPPONENT"  - pick the CPU fighter (arrows + ENTER)
+      PHASE 3  "SELECT DIFFICULTY"     - EASY / MEDIUM / HARD (arrows + ENTER)
 
-    SELECTION
-      * P1 browses with the ARROW keys, confirms with ENTER
-      * P2 browses with I/J/K/L, confirms with SPACE
-      * The hovered card previews that character's intro dialogue
-      * Glowing borders: red pulse for P1's cursor, blue pulse for P2's;
-        locked cards show "✓ READY" in green
-      * When BOTH are ready -> automatic countdown -> FIGHT! announcement
-        inside the fight scene
+    The card grid keeps the classic look: 5x2 cards, each showing the name
+    in character colour, a mini drawn warrior, HP/SPD/PWR stat bars, weapon
+    and special-move name; dharma chakras spin in the corners; the bottom
+    panel previews description + intro dialogue of the hovered hero.
+
+    Local 2-player has been REMOVED, so only ONE cursor exists and every
+    match ends with an AI-controlled opponent.
     """
     name = STATE_CHARACTER_SELECT
 
@@ -3946,12 +4877,20 @@ class CharacterSelectState(GameState):
     GAP_X, GAP_Y = 9, 12
     PANEL_TOP = 470                     # start of the info panel
 
+    PHASES = ("hero", "opponent", "difficulty")
+    PHASE_TITLES = {
+        "hero":       "CHOOSE YOUR WARRIOR",
+        "opponent":   "CHOOSE YOUR OPPONENT",
+        "difficulty": "SELECT DIFFICULTY",
+    }
+
     def __init__(self, game):
         super().__init__(game)
-        self.p1_idx = 0                          # ARJUNA
-        self.p2_idx = len(ROSTER) - 1            # SHAKUNI
-        self.p1_ready = False
-        self.p2_ready = False
+        self.phase_idx = 0                       # index into PHASES
+        self.hero_idx = 0                        # ARJUNA default
+        self.opp_idx = len(ROSTER) - 1           # SHAKUNI default
+        self.cursor = 0                          # live grid cursor
+        self.diff_idx = 1                        # EASY/MED/HARD -> MED
         self.t = 0                               # animation timer (frames)
         self.launch_timer = None                 # frames until fight starts
         self.flash = 0                           # white flash on lock-in
@@ -3959,6 +4898,10 @@ class CharacterSelectState(GameState):
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+    @property
+    def phase(self):
+        return self.PHASES[self.phase_idx]
+
     def cell_rect(self, i):
         """Screen rect of roster card number i (5 columns x 2 rows)."""
         col, row = i % self.COLS, i // self.COLS
@@ -3967,74 +4910,105 @@ class CharacterSelectState(GameState):
         return pygame.Rect(x, y, self.CARD_W, self.CARD_H)
 
     def _move(self, idx, dx, dy):
-        """Wrap-aware grid navigation for a cursor."""
+        """Wrap-aware grid navigation for the single cursor."""
         col, row = idx % self.COLS, idx // self.COLS
         col = (col + dx) % self.COLS
         row = (row + dy) % self.ROWS
         return row * self.COLS + col
 
+    def _confirm(self):
+        """Lock the current phase and advance the flow."""
+        play_sound("confirm")
+        self.flash = 8
+        if self.phase == "hero":
+            self.hero_idx = self.cursor
+            self.phase_idx = 1
+        elif self.phase == "opponent":
+            self.opp_idx = self.cursor
+            self.phase_idx = 2
+        else:                                    # difficulty confirmed
+            self.game.ai_level = AI_LEVELS[self.diff_idx]
+            self.launch_timer = 60               # short dramatic pause
+            return
+        # never let you fight yourself as the CPU
+        if self.hero_idx == self.opp_idx:
+            self.opp_idx = (self.opp_idx + 1) % len(ROSTER)
+        # reposition the one shared cursor for the new phase
+        self.cursor = (self.hero_idx if self.phase == "hero"
+                       else self.opp_idx)
+
     # ------------------------------------------------------------------
-    # input
+    # input - arrows navigate everything, ENTER confirms, ESC steps back
     # ------------------------------------------------------------------
     def handle_event(self, event):
         if event.type != pygame.KEYDOWN:
             return
         k = event.key
         if k == pygame.K_ESCAPE:
-            self.game.change_state(STATE_MENU)
+            if self.launch_timer is not None:
+                self.launch_timer = None
+            elif self.phase == "difficulty":
+                self.phase_idx = 1
+                self.cursor = self.opp_idx
+            elif self.phase == "opponent":
+                self.phase_idx = 0
+                self.cursor = self.hero_idx
+            else:
+                self.game.change_state(STATE_MENU)
+            return
+        if self.launch_timer is not None:
             return
 
-        # ---------------- PLAYER 1 : ARROW KEYS + ENTER ----------------
-        if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-            self.p1_ready = not self.p1_ready    # ENTER locks / unlocks P1
-            if self.p1_ready:
-                self.flash = 8
-        elif not self.p1_ready:
-            if k == pygame.K_LEFT:
-                self.p1_idx = self._move(self.p1_idx, -1, 0)
-            elif k == pygame.K_RIGHT:
-                self.p1_idx = self._move(self.p1_idx, +1, 0)
-            elif k == pygame.K_UP:
-                self.p1_idx = self._move(self.p1_idx, 0, -1)
-            elif k == pygame.K_DOWN:
-                self.p1_idx = self._move(self.p1_idx, 0, +1)
+        if self.phase == "difficulty":
+            # simple left/right selector over EASY | MEDIUM | HARD
+            if k in (pygame.K_LEFT, pygame.K_a):
+                self.diff_idx = (self.diff_idx - 1) % len(AI_LEVELS)
+                play_sound("select")
+            elif k in (pygame.K_RIGHT, pygame.K_d):
+                self.diff_idx = (self.diff_idx + 1) % len(AI_LEVELS)
+                play_sound("select")
+            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self._confirm()
+            return
 
-        # ---------------- PLAYER 2 : IJKL + SPACE ----------------------
-        if k == pygame.K_SPACE:
-            self.p2_ready = not self.p2_ready    # SPACE locks / unlocks P2
-            if self.p2_ready:
-                self.flash = 8
-        elif not self.p2_ready:
-            if k == pygame.K_j:
-                self.p2_idx = self._move(self.p2_idx, -1, 0)
-            elif k == pygame.K_l:
-                self.p2_idx = self._move(self.p2_idx, +1, 0)
-            elif k == pygame.K_i:
-                self.p2_idx = self._move(self.p2_idx, 0, -1)
-            elif k == pygame.K_k:
-                self.p2_idx = self._move(self.p2_idx, 0, +1)
+        # grid phases -------------------------------------------------
+        if k == pygame.K_LEFT:
+            self.cursor = self._move(self.cursor, -1, 0)
+            play_sound("select")
+        elif k == pygame.K_RIGHT:
+            self.cursor = self._move(self.cursor, +1, 0)
+            play_sound("select")
+        elif k == pygame.K_UP:
+            self.cursor = self._move(self.cursor, 0, -1)
+            play_sound("select")
+        elif k == pygame.K_DOWN:
+            self.cursor = self._move(self.cursor, 0, +1)
+            play_sound("select")
+        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self._confirm()
 
     # ------------------------------------------------------------------
-    # per-frame update (auto-launch once both warriors are READY)
+    # per-frame update (auto-launch once difficulty is locked)
     # ------------------------------------------------------------------
     def update(self, dt):
         self.t += 1
         if self.flash > 0:
             self.flash -= 1
-        if self.p1_ready and self.p2_ready and self.launch_timer is None:
-            self.launch_timer = 90               # ~1.5 s dramatic pause
         if self.launch_timer is not None:
             self.launch_timer -= 1
             if self.launch_timer <= 0:
-                self.game.start_fight(ROSTER[self.p1_idx],
-                                      ROSTER[self.p2_idx])
+                self.game.start_fight(ROSTER[self.hero_idx],
+                                      ROSTER[self.opp_idx])
 
     # ------------------------------------------------------------------
-    # drawing — cards
+    # drawing - cards
     # ------------------------------------------------------------------
     def _draw_card(self, target, i, hero):
         r = self.cell_rect(i)
-        hovered = i in (self.p1_idx, self.p2_idx)
+        hovered = (i == self.cursor and self.phase != "difficulty")
+        chosen_hero = (i == self.hero_idx and self.phase != "hero")
+        chosen_opp = (i == self.opp_idx and self.phase == "opponent"
+                      and i != self.cursor)
         col = hero["color"]
         spc = hero["special_color"]
 
@@ -4053,9 +5027,8 @@ class CharacterSelectState(GameState):
         # ---- name in the character's own colour ----
         nm = FONT_TINY.render(hero["name"], True, col)
         target.blit(nm, (r.x + 6, r.y + 5))
-        pw = FONT_TINY.size(hero["weapon"])[0]
         wtag = FONT_TINY.render(hero["weapon"], True, GREY)
-        target.blit(wtag, (r.right - pw - 6, r.y + 7))
+        target.blit(wtag, (r.right - wtag.get_width() - 6, r.y + 7))
 
         # ---- stat bars: HP / SPD / PWR ----
         bx = prev.right + 8
@@ -4078,41 +5051,84 @@ class CharacterSelectState(GameState):
             sy += 22
 
         # ---- special move name in special_color ----
-        sn = f"★ {hero['special_name']}"
-        sw_ = FONT_TINY.size(sn)[0]
-        if sw_ > r.width - 12:                  # shrink-fit long names
-            sn = hero["special_name"][:14] + "…"
+        sn = "\u2605 " + hero["special_name"]
+        if FONT_TINY.size(sn)[0] > r.width - 12:     # shrink-fit long names
+            sn = "\u2605 " + hero["special_name"][:14] + "\u2026"
         st = FONT_TINY.render(sn, True, spc)
         target.blit(st, (r.centerx - st.get_width() // 2, r.bottom - 18))
 
-        # ---- glowing cursor borders (red = P1, blue = P2) ----
-        if i == self.p1_idx:
+        # ---- glowing cursor border: red = picking hero, blue = CPU pick
+        if hovered:
+            warm = self.phase == "hero"
+            base = DEEP_RED if warm else DARK_BLUE
+            edge = (255, 70, 70) if warm else (90, 150, 255)
             pulse = 150 + 105 * abs(math.sin(self.t * 0.08))
-            glow_surf = pygame.Surface((r.w + 16, r.h + 16), pygame.SRCALPHA)
-            pygame.draw.rect(glow_surf, (*DEEP_RED, int(pulse) // 3),
-                             (0, 0, r.w + 16, r.h + 16), 8, border_radius=14)
+            glow_surf = pygame.Surface((r.w + 16, r.h + 16),
+                                       pygame.SRCALPHA)
+            pygame.draw.rect(glow_surf, (*base, int(pulse) // 2),
+                             (0, 0, r.w + 16, r.h + 16), 8,
+                             border_radius=14)
             target.blit(glow_surf, (r.x - 8, r.y - 8))
-            pygame.draw.rect(target, (255, 70, 70), r, 3, border_radius=10)
-            tag = FONT_TINY.render("P1 ✓ READY" if self.p1_ready
-                                   else "P1", True,
-                                   (60, 220, 60) if self.p1_ready else WHITE)
+            pygame.draw.rect(target, edge, r, 3, border_radius=10)
+            tag_txt = "YOU" if self.phase == "hero" else "CPU"
+            tag = FONT_TINY.render(tag_txt, True, WHITE)
             target.blit(tag, (r.x + 4, r.y - 20))
-        if i == self.p2_idx:
-            pulse = 150 + 105 * abs(math.sin(self.t * 0.08 + 1.3))
-            glow_surf = pygame.Surface((r.w + 16, r.h + 16), pygame.SRCALPHA)
-            pygame.draw.rect(glow_surf, (*DARK_BLUE, int(pulse) // 2),
-                             (0, 0, r.w + 16, r.h + 16), 8, border_radius=14)
-            target.blit(glow_surf, (r.x - 8, r.y - 8))
-            inner = r.inflate(-10, -10)
-            pygame.draw.rect(target, (90, 150, 255), inner, 3,
-                             border_radius=8)
-            tag = FONT_TINY.render("P2 ✓ READY" if self.p2_ready
-                                   else "P2", True,
-                                   (60, 220, 60) if self.p2_ready else WHITE)
-            target.blit(tag, (r.right - tag.get_width() - 4, r.y - 20))
+
+        # ---- locked picks show a green check mark ----
+        if chosen_hero:
+            ok = FONT_TINY.render("\u2713 YOU", True, GREEN)
+            target.blit(ok, (r.x + 4, r.y - 20))
+        if chosen_opp:
+            ok = FONT_TINY.render("\u2713 CPU", True, GREEN)
+            target.blit(ok, (r.right - ok.get_width() - 4, r.y - 20))
 
     # ------------------------------------------------------------------
-    # drawing — bottom info panel (description + dialogue quote)
+    # drawing - difficulty picker (phase 3)
+    # ------------------------------------------------------------------
+    DIFF_INFO = {
+        "EASY":   ("Duryodhana\u2019s army soldier \u2014 slow reactions, "
+                   "random attacks, rarely blocks.", (120, 200, 120)),
+        "MEDIUM": ("Kaurava warrior \u2014 reads your attacks, strings "
+                   "combos, fires astras when ready.", GOLD),
+        "HARD":   ("Bhishma-level \u2014 predicts movement, blocks almost "
+                   "everything, punishes hard.", DEEP_RED),
+    }
+
+    def _draw_difficulty(self, target):
+        y = self.GRID_Y + 20
+        cw, gap = 260, 40
+        total = len(AI_LEVELS) * cw + (len(AI_LEVELS) - 1) * gap
+        x0 = (SCREEN_WIDTH - total) // 2
+        for i, lvl in enumerate(AI_LEVELS):
+            r = pygame.Rect(x0 + i * (cw + gap), y, cw, 150)
+            sel = (i == self.diff_idx)
+            pygame.draw.rect(target, (22, 12, 30), r, border_radius=12)
+            desc_col = self.DIFF_INFO[lvl][1]
+            if sel:
+                pulse = 150 + 105 * abs(math.sin(self.t * 0.09))
+                glow = pygame.Surface((r.w + 18, r.h + 18), pygame.SRCALPHA)
+                pygame.draw.rect(glow, (*GOLD, int(pulse) // 2),
+                                 (0, 0, r.w + 18, r.h + 18), 6,
+                                 border_radius=16)
+                target.blit(glow, (r.x - 9, r.y - 9))
+                pygame.draw.rect(target, GOLD, r, 3, border_radius=12)
+            draw_centered_text(target, lvl, FONT_LARGE,
+                               GOLD if sel else GREY,
+                               r.centerx, r.y + 22)
+            lines = wrap_text(self.DIFF_INFO[lvl][0], FONT_TINY,
+                              r.width - 24, 3)
+            ly = r.y + 80
+            for ln in lines:
+                img = FONT_TINY.render(ln, True, desc_col)
+                target.blit(img, (r.centerx - img.get_width() // 2, ly))
+                ly += 17
+        draw_centered_text(
+            target, "Your warrior: " + ROSTER[self.hero_idx]["name"] +
+                    "   vs   CPU: " + ROSTER[self.opp_idx]["name"],
+            FONT_SMALL, WHITE, SCREEN_WIDTH // 2, y + 180)
+
+    # ------------------------------------------------------------------
+    # drawing - bottom info panel (description + dialogue quote)
     # ------------------------------------------------------------------
     def _draw_panel(self, target):
         p = pygame.Rect(24, self.PANEL_TOP, SCREEN_WIDTH - 48, 112)
@@ -4123,40 +5139,25 @@ class CharacterSelectState(GameState):
         draw_dharma_chakra(target, p.right - 26, p.centery, 16, SAFFRON,
                            spokes=12, angle_offset=-self.t * 0.02)
 
-        # two focus heroes: whoever is hovering (P1 takes precedence
-        # visually, P2 shown mirrored on the right side)
-        left_hero = ROSTER[self.p1_idx]
-        right_hero = ROSTER[self.p2_idx]
-
-        def block(hero, x, w, align_right=False):
-            head = f"{hero['name']} — {hero['epithet']}"
-            h = FONT_SMALL.render(head, True, hero["color"])
-            desc = wrap_text(hero["description"], FONT_TINY, w - 20, 2)
-            quote_src = (hero["intro_dialogue"][0]
-                         if self.t // 45 % 2 == 0
-                         else hero["intro_dialogue"][1])
-            quote = wrap_text(f"“{quote_src}”", FONT_TINY, w - 20, 2)
-            tx = x + (w - h.get_width()) // 2 if not align_right else \
-                x + w - h.get_width()
-            target.blit(h, (tx, p.y + 8))
-            yy = p.y + 34
-            for line in desc:
-                img = FONT_TINY.render(line, True, GREY)
-                target.blit(img, (x + 10, yy))
-                yy += 17
-            yy += 2
-            for line in quote:
-                img = FONT_TINY.render(line, True, GOLD)
-                target.blit(img, (x + 10, yy))
-                yy += 17
-
-        half = (p.width - 90) // 2
-        block(left_hero, p.x + 46, half)
-        block(right_hero, p.x + 46 + half + 20, half)
-
-        # VS emblem between the two blocks
-        vs = FONT_MEDIUM.render("VS", True, DEEP_RED)
-        target.blit(vs, (p.centerx - vs.get_width() // 2, p.centery - 14))
+        hero = ROSTER[self.cursor]
+        head = hero["name"] + " \u2014 " + hero["epithet"]
+        h = FONT_SMALL.render(head, True, hero["color"])
+        target.blit(h, (p.x + 56, p.y + 8))
+        desc = wrap_text(hero["description"], FONT_TINY, 520, 2)
+        yy = p.y + 34
+        for line in desc:
+            target.blit(FONT_TINY.render(line, True, GREY), (p.x + 56, yy))
+            yy += 17
+        # hovering previews the intro dialogue (rotates between the lines)
+        quote_src = (hero["intro_dialogue"][0]
+                     if self.t // 45 % 2 == 0 else hero["intro_dialogue"][1])
+        qlines = wrap_text("\u201c" + quote_src + "\u201d", FONT_TINY,
+                           470, 2)
+        qy = p.y + 34
+        for line in qlines:
+            img = FONT_TINY.render(line, True, GOLD)
+            target.blit(img, (p.right - 56 - img.get_width() - 8, qy))
+            qy += 17
 
     # ------------------------------------------------------------------
     # main draw
@@ -4175,41 +5176,56 @@ class CharacterSelectState(GameState):
                            20, GOLD, 16, spin)
 
         # ---- gold title + control hints ----
-        draw_centered_text(target, "CHOOSE YOUR WARRIOR", FONT_LARGE,
-                           GOLD, SCREEN_WIDTH // 2, 26, shadow=True)
-        draw_centered_text(target,
-                           "P1: ARROW KEYS browse · ENTER confirm      "
-                           "P2: I J K L browse · SPACE confirm",
-                           FONT_SMALL, SAFFRON, SCREEN_WIDTH // 2, 100)
+        draw_centered_text(target, self.PHASE_TITLES[self.phase],
+                           FONT_LARGE, GOLD, SCREEN_WIDTH // 2, 26,
+                           shadow=True)
+        hint = ("ARROW KEYS browse \u00b7 ENTER confirm \u00b7 ESC back"
+                if self.phase != "difficulty"
+                else "LEFT/RIGHT choose \u00b7 ENTER start battle "
+                     "\u00b7 ESC back")
+        draw_centered_text(target, hint, FONT_SMALL, SAFFRON,
+                           SCREEN_WIDTH // 2, 100)
 
-        # ---- the 10 cards ----
-        for i, hero in enumerate(ROSTER):
-            self._draw_card(target, i, hero)
+        # ---- phase progress dots ----
+        for pi in range(len(self.PHASES)):
+            cx = SCREEN_WIDTH // 2 + (pi - 1) * 34
+            done = pi < self.phase_idx
+            now = pi == self.phase_idx
+            pygame.draw.circle(target, GOLD if now else
+                               (GREEN if done else GREY), (cx, 78), 6)
+
+        # ---- content of the current phase ----
+        if self.phase == "difficulty":
+            self._draw_difficulty(target)
+        else:
+            for i, hero in enumerate(ROSTER):
+                self._draw_card(target, i, hero)
 
         # ---- bottom info panel ----
         self._draw_panel(target)
 
         # ---- status line under the grid ----
-        status = []
-        status.append(f"P1: {ROSTER[self.p1_idx]['name']}"
-                      + ("  ✓ READY" if self.p1_ready else ""))
-        status.append(f"P2: {ROSTER[self.p2_idx]['name']}"
-                      + ("  ✓ READY" if self.p2_ready else ""))
-        draw_centered_text(target, "      |      ".join(status),
-                           FONT_SMALL, WHITE, SCREEN_WIDTH // 2,
-                           self.GRID_Y + 2 * self.CARD_H + self.GAP_Y + 26)
+        if self.phase != "difficulty":
+            who = "YOU" if self.phase == "hero" else "CPU OPPONENT"
+            status = who + ": " + ROSTER[self.cursor]["name"]
+            if self.phase == "opponent":
+                status = ("YOU: " + ROSTER[self.hero_idx]["name"] +
+                          "   |   " + status)
+            draw_centered_text(target, status, FONT_SMALL, WHITE,
+                               SCREEN_WIDTH // 2,
+                               self.GRID_Y + 2 * self.CARD_H +
+                               self.GAP_Y + 26)
 
-        # ---- launch sequence: "FIGHT!" teaser banner ----
+        # ---- launch sequence banner ----
         if self.launch_timer is not None:
             grow = 1.0 + 0.35 * math.sin(self.t * 0.35)
             fs = pygame.font.SysFont("arial", max(20, int(56 * grow)),
                                      bold=True)
             draw_centered_text(target, "THE WAR BEGINS...", fs, SAFFRON,
                                SCREEN_WIDTH // 2, 250, shadow=True)
-        elif blink_visible(pygame.time.get_ticks(), 900, 0.6):
             draw_centered_text(target,
-                               "Both warriors must press their confirm key!",
-                               FONT_SMALL, GREEN, SCREEN_WIDTH // 2, 250)
+                               "AI LEVEL: " + AI_LEVELS[self.diff_idx],
+                               FONT_MEDIUM, GOLD, SCREEN_WIDTH // 2, 310)
 
         # ---- white lock-in flash ----
         if self.flash > 0:
@@ -4238,14 +5254,16 @@ class FightState(GameState):
         # y = 0 means "standing on the ground line" (GROUND_Y == 430).
         self.f1 = Fighter(p1_data, 300, 0, facing=1, is_player2=False,
                           controls=P1_KEYS)
+        # OVERHAUL STEP 2: the opponent slot is ALWAYS machine-driven now.
         self.f2 = Fighter(p2_data, 900, 0, facing=-1, is_player2=True,
-                          controls=P2_KEYS)
-        # ---- AI OPPONENT SYSTEM: in single-player mode P2's slot is run
-        # by an AIBrain.  The brain publishes virtual key intents which
-        # _apply_ai_input() folds into the same input pipeline humans use.
+                          controls=None)
+        # ---- AI OPPONENT SYSTEM: P2's slot is run by an AIController.
+        # The brain publishes virtual key intents which _apply_ai_input()
+        # folds into the same input pipeline the human player uses.  It
+        # also re-points at the live fighters after every round reset.
         self.ai_level = getattr(game, "ai_level", "MEDIUM")
-        if not getattr(game, "two_player", False):
-            self.f2.brain = AIBrain(self.f2, self.f1, self.ai_level)
+        self.p2_is_ai = True                    # fixed: no local 2-player
+        self.f2.brain = AIController(self.f2, self.f1, self.ai_level)
         self.round_start = pygame.time.get_ticks()
         # spawn records so rounds can be reset with pristine fighters
         self.spawn_data = [
@@ -4286,6 +5304,15 @@ class FightState(GameState):
         self.tint_color = WHITE          # current veil RGB
         self.hit_freeze_frames = 0       # simulation-pause frames left
         self.lightning_bolts = []        # [(points, color, ttl), ...]
+        # ---- ULTIMATE POLISH: slow-mo + camera zoom-in state ----------
+        self.slowmo_frames = 0           # 25%-speed frames remaining
+        self.slowmo_phase = 0            # frame counter mod 4
+        self.ult_zoom = None             # {"fighter":f,"frames":n} while active
+        # ---- PAUSE SYSTEM (ESC during a fight) -------------------------
+        self.paused = False              # True while pause menu is open
+        self.pause_index = 0             # highlighted pause-menu option
+        self.pause_options = ["RESUME", "RESTART ROUND",
+                              "SETTINGS", "QUIT TO MENU"]
         for f in (self.f1, self.f2):     # wire the shared fx into fighters
             f.fx = self.fx
 
@@ -4305,6 +5332,12 @@ class FightState(GameState):
         # "dyut_sabha"/"chakravyuha"); arcade bouts fall back to the
         # default sunset plains of Kurukshetra.
         self.stage_name = getattr(game, "story_stage", None) or "kurukshetra"
+        # SOUND TRIGGERS: battle music for THIS stage (falls back to the
+        # generic "battle" track name if no per-stage file is present —
+        # SoundManager tries both before resorting to silence/beeps), and
+        # the round-start cue when the announcer shouts "FIGHT!".
+        play_bgm("battle_" + self.stage_name)
+        self._round_start_cued = False     # armed once controls unlock
         self._intro_build(p1_data, p2_data)
         if self.show_intro:
             self._intro_start("FADE")
@@ -4601,37 +5634,123 @@ class FightState(GameState):
             self._finish_special_credit(f, foe)
 
     def handle_event(self, event):
-        """KEYDOWN-driven actions: attacks, jump and the special.
+        """KEYDOWN-driven actions: attacks, jump, the special and the
+        ULTIMATE.  Also hosts the PAUSE SYSTEM (ESC opens a frozen menu).
 
         Movement / crouch / block are HOLD-based and handled per-frame in
         _process_movement(); attacks are edge-triggered so holding a key
         does not machine-gun (the 20/25-frame cooldowns also apply)."""
         if event.type != pygame.KEYDOWN:
             return
+        # ----------------------- PAUSE MENU NAVIGATION ------------------
+        if self.paused:
+            k = event.key
+            if k in (pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_SPACE):
+                self.paused = False                    # RESUME
+                play_sound("confirm")
+            elif k in (pygame.K_UP, pygame.K_w):
+                self.pause_index = (self.pause_index - 1) % \
+                    len(self.pause_options)
+                play_sound("select")
+            elif k in (pygame.K_DOWN, pygame.K_s):
+                self.pause_index = (self.pause_index + 1) % \
+                    len(self.pause_options)
+                play_sound("select")
+            elif k == pygame.K_RETURN or k == pygame.K_SPACE:
+                pass                                   # covered above
+            elif k == pygame.K_LEFT:
+                self._pause_adjust(-1)
+            elif k == pygame.K_RIGHT:
+                self._pause_adjust(+1)
+            elif k == pygame.K_m:
+                get_sounds().toggle_mute()             # quick mute toggle
+            return
+        # ----------------------- OPEN THE PAUSE MENU --------------------
         if event.key == pygame.K_ESCAPE:
-            self.game.change_state(STATE_MENU)
+            self.paused = True
+            self.pause_index = 0
+            play_sound("confirm")
             return
         if self.hud_freeze or self.winner:
             return
         k = event.key
         # ---------------- PLAYER 1 : Arrow keys + Z (punch) X (kick) ------
-        if k == pygame.K_UP:
-            self.f1.jump()
+        if k == pygame.K_UP or k == pygame.K_SPACE:
+            self.f1.jump()                             # UP or SPACE jumps
         elif k == pygame.K_z:
             self.f1.start_attack("punch")
         elif k == pygame.K_x:
             self.f1.start_attack("kick")
         elif k == pygame.K_c or k == pygame.K_LCTRL or k == pygame.K_RCTRL:
             self._special_attempt(self.f1)      # P1 astral: C (or Ctrl)
-        # ---------------- PLAYER 2 : IJKL + B (punch) N (kick) -----------
-        elif k == pygame.K_i:
-            self.f2.jump()
-        elif k == pygame.K_b:
-            self.f2.start_attack("punch")
-        elif k == pygame.K_n:
-            self.f2.start_attack("kick")
-        elif k == pygame.K_m or k == pygame.K_SPACE:
-            self._special_attempt(self.f2)      # P2 astral: M (or Space)
+        elif k == pygame.K_v:
+            self._ultimate_attempt(self.f1)     # ULTIMATE: V (HP<30%+meter)
+        # NOTE (OVERHAUL STEP 2): the old human-P2 bindings (I/J/K/L move,
+        # B punch, N kick, M special) are GONE — the opponent slot is now
+        # exclusively driven by AIBrain via _apply_ai_input().
+        # ---- CPU JUMP: brains hold "up" virtually; the human pipeline
+        # only sees KEYDOWN, so we translate the rising edge here.
+        if getattr(self.f2, "brain", None):
+            held_now = "up" in self.f2.brain.held
+            if held_now and not getattr(self, "_ai_up_prev", False):
+                self.f2.jump()
+            self._ai_up_prev = held_now
+
+    # ------------------------------------------------------------------
+    # PAUSE SYSTEM helpers
+    # ------------------------------------------------------------------
+    def _pause_select(self, idx):
+        """Execute the highlighted pause-menu option."""
+        self.paused = False
+        opt = self.pause_options[idx]
+        play_sound("confirm")
+        if opt == "RESUME":
+            return
+        if opt == "RESTART ROUND":
+            self._restart_current_round()
+        elif opt == "SETTINGS":
+            self.game.change_state(STATE_SETTINGS)
+        elif opt == "QUIT TO MENU":
+            self.game.change_state(STATE_MENU)
+
+    def _pause_adjust(self, delta):
+        """LEFT/RIGHT tweaks the highlighted setting row (volume etc.)."""
+        opt = self.pause_options[self.pause_index]
+        if opt == "SETTINGS":
+            s = get_sounds()
+            s.adjust_master(delta * 5)                 # coarse ±5%
+
+    def _restart_current_round(self):
+        """PAUSE MENU -> RESTART ROUND: rewind the round that is being
+        fought.  Round wins earned BEFORE this round are kept; HP, meters,
+        projectiles and every screen effect reset to full."""
+        try:
+            self.winner = None
+            self.end_delay_until = None
+            self.match_over = False
+            self.timer_left = 99.0
+            self.hit_sparks.clear()
+            self.combo_pops.clear()
+            self.fx.particles.clear()
+            self.shake_frames = 0
+            self.shake_intensity = 0
+            self.flash_frames = 0
+            self.tint_frames = 0
+            self.hit_freeze_frames = 0
+            self.slowmo_frames = 0
+            self.ult_zoom = None
+            self.lightning_bolts.clear()
+            for f in (self.f1, self.f2):
+                f.projectiles = []
+                f.fx = self.fx
+            self._reset_fighter(self.f1, 1)
+            self._reset_fighter(self.f2, -1)
+            self.round_start = pygame.time.get_ticks()
+            self.taunt_at = self.round_start + random.randint(6000, 9000)
+            self.set_banner(f"ROUND {self.round_number}  ·  RESTART",
+                            SAFFRON, 1300)
+        except Exception as _exc:                     # never crash on pause
+            print(f"[pause-guard] restart: {_exc!r}")
 
     @staticmethod
     def _back_key_action(held_back, down_held):
@@ -4658,7 +5777,7 @@ class FightState(GameState):
         CPU's virtual presses whenever an AI fighter occupies that slot."""
         pressed = pygame.key.get_pressed()
         cpu = None
-        if not self.game.two_player and getattr(self.f2, "brain", None):
+        if getattr(self.f2, "brain", None):   # ALWAYS true post-overhaul
             cpu = self.f2
         elif getattr(self.f1, "brain", None):
             cpu = self.f1
@@ -4722,14 +5841,18 @@ class FightState(GameState):
             if not moved and f.state == "walk":
                 f.stop_walking()
 
-        # ---------------- PLAYER 2 (IJKL + B/N) ------------------
+        # ---------------- CPU OPPONENT (AI brain only) ----------------
+        # OVERHAUL STEP 2: no human ever controls fighter #2 any more.
+        # The brain's virtual keys were already folded into `pressed` by
+        # _apply_ai_input(), so we simply run the SAME movement rules on
+        # that array for f2.  (rev2 keeps MAYA JAAL mind-games working.)
         f = self.f2
         rev2 = now_ms < f.controls_reversed_until
-        left_held = bool(pressed[pygame.K_l]) if rev2 \
-            else bool(pressed[pygame.K_j])
-        right_held = bool(pressed[pygame.K_j]) if rev2 \
-            else bool(pressed[pygame.K_l])
-        down_held = bool(pressed[pygame.K_k])
+        left_held = bool(pressed[pygame.K_RIGHT]) if rev2 \
+            else bool(pressed[pygame.K_LEFT])
+        right_held = bool(pressed[pygame.K_LEFT]) if rev2 \
+            else bool(pressed[pygame.K_RIGHT])
+        down_held = bool(pressed[pygame.K_DOWN])
         back_held = (left_held if f.facing > 0 else right_held)
         blocking = down_held and back_held
         if blocking:
@@ -4779,6 +5902,9 @@ class FightState(GameState):
             attacker.attack_hit = True
             raw_dmg = attacker.current_damage()
             was_blocking = defender.state == "block"
+            # SOUND TRIGGER: the swing itself (punch / kick) connects...
+            play_sound(attacker.state if attacker.state in ("punch", "kick")
+                       else "hit")
             applied = defender.take_hit(raw_dmg, attacker)
 
             # ---- DAMAGE SYSTEM: meter gain = 1.5x damage actually dealt --
@@ -4789,6 +5915,8 @@ class FightState(GameState):
             if combo >= 2:
                 self.combo_pops.append(
                     (attacker, f"{combo} HIT COMBO!", 70))
+            if combo >= 3:                     # SOUND TRIGGER: combo 3+
+                play_sound("combo")
 
             spark_col = GOLD if was_blocking else DEEP_RED
             self.hit_sparks.append((
@@ -4820,6 +5948,8 @@ class FightState(GameState):
                     if combo >= 2:
                         self.combo_pops.append(
                             (f, f"{combo} HIT COMBO!", 70))
+                    if combo >= 3:                 # SOUND TRIGGER: combo 3+
+                        play_sound("combo")
                     self.hit_sparks.append((pr["x"], pr["y"], 16,
                                             f.special_color))
                     # impact explosion in the astral's colour
@@ -4833,13 +5963,23 @@ class FightState(GameState):
                     f.projectiles.remove(pr)
 
     def _drain_fx_requests(self):
-        """Consume the ParticleSystem's queued shake / spark requests."""
+        """Consume the ParticleSystem's queued screen-effect requests:
+        shake / sparks / white flash / colour tint / hit-freeze."""
         for frames, intensity in self.fx.drain_shakes():
             # strongest request wins the amplitude, durations add up
             self.shake_intensity = max(self.shake_intensity, intensity)
             self.shake_frames = max(self.shake_frames, frames)
         for x, y, t, c in self.fx.drain_sparks():
             self.hit_sparks.append((x, y, t, c))
+        # ---- SCREEN EFFECTS: flash overlay / colour veil / hit freeze --
+        for fr in self.fx.drain_flashes():
+            self.flash_frames = max(self.flash_frames, int(fr))
+        for col, fr in self.fx.drain_tints():
+            self.tint_frames = max(self.tint_frames, int(fr))
+            self.tint_color = col
+        for fr in self.fx.drain_freezes():
+            budget = min(int(fr), MAX_FREEZE_FRAMES)
+            self.hit_freeze_frames = max(self.hit_freeze_frames, budget)
         # direct sparks queued inside Fighter._spawn_astra
         for f in (self.f1, self.f2):
             if f._pending_fx_sparks:
@@ -4847,13 +5987,82 @@ class FightState(GameState):
                     self.hit_sparks.append((x, y, t, c))
                 f._pending_fx_sparks.clear()
 
+    # ------------------------------------------------------------------
+    # ULTIMATE ABILITIES — cast attempt + slow-mo / zoom direction
+    # ------------------------------------------------------------------
+    def _ultimate_attempt(self, f):
+        """Try to fire f's ULTIMATE. On success: dramatic banner,
+        20-frame slow-motion and a camera zoom-in on the caster."""
+        foe = self.f2 if f is self.f1 else self.f1
+        try:
+            ok = f.start_ultimate(opponent=foe, fx=self.fx)
+        except Exception as _exc:             # never crash mid-fight
+            print(f"[ult-guard] {f.name}: {_exc!r}")
+            return
+        if not ok:
+            return
+        ult = f.get_ultimate(f.name)
+        self.set_banner(f"{f.name}'s ULTIMATE: {ult.get('name', '')}!",
+                        GOLD, 3000)
+        self.slowmo_frames = 20               # game runs at 25% speed
+        self.ult_zoom = {"fighter": f, "frames": 45}   # camera push-in
+
+    def _update_slowmo_and_zoom(self):
+        """Tick the slow-motion countdown and the ultimate camera zoom.
+        Returns True when this frame should be SKIPPED (25% speed)."""
+        # --- slow-mo: only update every 4th simulation frame -----------
+        skip = False
+        if self.slowmo_frames > 0:
+            self.slowmo_frames -= 1
+            self.slowmo_phase = (self.slowmo_phase + 1) % 4
+            if self.slowmo_phase != 0:
+                skip = True                   # 60 render FPS, 15 sim FPS
+        else:
+            self.slowmo_phase = 0
+        # --- camera zoom-in on the warrior who just unleashed ----------
+        z = self.ult_zoom
+        if z:
+            z["frames"] -= 1
+            try:
+                frac = max(0.0, min(1.0, z["frames"] / 45.0))
+                z["fighter"].draw_scale = 1.0 + 0.28 * frac   # ease back out
+            except Exception:
+                pass
+            if z["frames"] <= 0:
+                try:
+                    z["fighter"].draw_scale = 1.0
+                except Exception:
+                    pass
+                self.ult_zoom = None
+        return skip
+
     def update(self, dt_ms):
         # The main loop hands every state the frame time in MILLISECONDS
         # (clock.tick returns ms); the fight timer works in seconds.
         dt = dt_ms / 1000.0
         now = pygame.time.get_ticks()
         self.fight_frame += 1          # master frame clock (60 FPS)
+        # ---- PAUSE SYSTEM: everything freezes until the menu closes ---
+        if self.paused:
+            return
+        # ---- ULTIMATE / KO DRAMA slow-motion: skip 3 of every 4
+        #      simulation frames (25% speed) while still rendering at 60.
+        if self._update_slowmo_and_zoom():
+            self.fx.update()           # particles keep drifting in slow-mo
+            return
+        # ---- HIT FREEZE: impact pause before anything else moves ------
+        if self.hit_freeze_frames > 0:
+            self.hit_freeze_frames -= 1
+            return
         intro_left = (now - self.round_start) < 1400
+        # SOUND TRIGGER: the "FIGHT!" announcer cue, fired exactly once
+        # per round the moment controls unlock (also re-armed by the
+        # round reset in _begin_next_round).
+        if intro_left:
+            self._round_start_cued = False
+        elif not self._round_start_cued and not self.winner:
+            self._round_start_cued = True
+            play_sound("round_start")
         self.hud_freeze = bool(self.winner) or intro_left
         if not self.hud_freeze:
             # ---- TIMER: 99-second countdown, only while the fight is live
@@ -4869,16 +6078,31 @@ class FightState(GameState):
                 # ---- AI OPPONENT SYSTEM: think before the input pass ----
                 for f in (self.f1, self.f2):
                     if getattr(f, "brain", None):
-                        f.brain.update()
+                        try:
+                            f.brain.update()       # never crash mid-fight
+                        except Exception as _exc:  # pragma: no cover
+                            print(f"[ai-guard] {f.name}: {_exc!r}")
+                            f.brain.held.clear()
                 self._process_movement()
-                self.f1.update(self.f2)
-                self.f2.update(self.f1)
-                self._resolve_hits()
-                # ---- SPECIAL MOVES SYSTEM pipeline ----
-                self._update_astra_projectiles()   # fly astras + spawn trails
-                self._resolve_projectiles()        # astra <-> body collisions
-                self._resolve_vortex()             # CHAKRAVYUHA BREAKER ring
-                self._drain_fx_requests()          # shake/sparks queued by fx
+                for _f, _o in ((self.f1, self.f2), (self.f2, self.f1)):
+                    try:
+                        _f.update(_o)              # guarded: never crash
+                    except Exception as _exc:      # pragma: no cover
+                        print(f"[fighter-guard] {_f.name}: {_exc!r}")
+                # ---- CRASH-PROOF COMBAT PIPELINE --------------------
+                # try/except guards around every risky step (projectile
+                # flight, hitbox intersections, particle bookkeeping).
+                # A single bad frame must NEVER close the game mid-fight:
+                # we simply log and let the next frame continue.
+                for _step in (self._resolve_hits,
+                              self._update_astra_projectiles,
+                              self._resolve_projectiles,
+                              self._resolve_vortex,
+                              self._drain_fx_requests):
+                    try:
+                        _step()
+                    except Exception as _exc:      # pragma: no cover
+                        print(f"[fx-guard] {_step.__name__}: {_exc!r}")
                 # occasional taunts straight out of the character database
                 if now >= self.taunt_at:
                     self.taunt_at = now + random.randint(9000, 14000)
@@ -4913,11 +6137,14 @@ class FightState(GameState):
         if self.winner and now >= self.end_delay_until:
             if self.match_over:
                 self.game.result_winner = self.winner.name
+                # ---- SAVE SYSTEM: tally the decided match -------------
+                player_won = (self.winner is self.f1)
+                save_save(wins_delta=1 if player_won else 0,
+                          losses_delta=0 if player_won else 1)
                 if getattr(self.game, "game_mode", GAME_VS) == GAME_STORY:
                     # ---- STORY MODE: chapter resolved, no result screen --
                     ch = STORY_CHAPTERS[min(self.game.story_index,
                                             len(STORY_CHAPTERS) - 1)]
-                    player_won = (self.winner is self.f1)
                     self.game.story_last_win = player_won
                     if player_won:
                         self.game.story_progress = max(
@@ -4925,6 +6152,7 @@ class FightState(GameState):
                         self.game.story_index = min(
                             self.game.story_index + 1,
                             len(STORY_CHAPTERS) - 1)
+                    save_save(story_progress=self.game.story_progress)
                     self.game.change_state(STATE_STORY)
                 else:
                     self.game.change_state(STATE_RESULT)
@@ -4951,6 +6179,9 @@ class FightState(GameState):
         # best of 3: two round wins ends the match
         if self.round_wins[w] >= 2:
             self.match_over = True
+            # SOUND TRIGGER: the bout is decided -> victory music takes
+            # over from the battle loop (fade-style stop, then load).
+            play_bgm("victory")
 
     def _reset_fighter(self, f, facing):
         """Put one fighter back to its starting stance for a new round.
@@ -4973,6 +6204,10 @@ class FightState(GameState):
         if old_brain is not None:
             f.brain = old_brain
             old_brain.reset()
+            # keep the brain wired to the LIVE fighter pair after reset —
+            # __dict__ swap replaced self.f2's identity inside the brain
+            old_brain.fighter = f
+            old_brain.opponent = self.f1 if f.is_player2 else self.f2
 
     def _begin_next_round(self):
         """Round interlude ended — restore both warriors and tick the
@@ -5216,6 +6451,12 @@ class FightState(GameState):
         self._draw_battle_stage(world_target)
         self.f1.draw(world_target)
         self.f2.draw(world_target)
+        # ---- AI VISUAL INDICATOR: "CPU" tag floating over the head ----
+        for _f in (self.f1, self.f2):
+            try:
+                _f.draw_ai_tag(world_target)
+            except Exception:               # never crash the render pass
+                pass
 
         # ---- SPECIAL MOVES SYSTEM visuals (all pure pygame shapes) ----
         self._draw_astra_projectiles(world_target)   # arrows/bolts/discs/walls
@@ -5491,9 +6732,14 @@ class FightState(GameState):
         smooth draining fill, colour tiers and 'HP/max' numbers inside."""
         bar_w, bar_h = 400, 30
         # ---- character name above the bar, in the fighter's own colour --
-        name_img = FONT_SMALL.render(
-            ("P1  " if not f.is_player2 else "") + f.name, True,
-            f.color if f.color != WHITE else GOLD)
+        # AI VISUAL INDICATOR (spec STEP 5): the CPU slot shows its level
+        # right next to the health bar, e.g. "AI - HARD".
+        prefix = "P1  " if not f.is_player2 else ""
+        if getattr(f, "brain", None) is not None:
+            lvl = getattr(f.brain, "level", "?")
+            prefix += "AI - %s   " % lvl
+        name_img = FONT_SMALL.render(prefix + f.name, True,
+                                     f.color if f.color != WHITE else GOLD)
         if align_left:
             target.blit(name_img, (x, y - 26))
         else:
