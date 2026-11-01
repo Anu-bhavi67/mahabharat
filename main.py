@@ -1175,6 +1175,7 @@ class Fighter:
         self.stun_timer = 0               # total stun budget this frame
         self.dodge_timer = 0              # invulnerability frames left
         self.anim_frame = 0               # integer animation step
+        self.passive_timer = 0            # per-second upkeep tick (Bhishma)
         self.is_hit = False               # True while recoiling
         self.is_blocking = False          # guarding right now
         self.is_crouching = False         # ducking right now
@@ -1183,6 +1184,17 @@ class Fighter:
         self.is_kicking = False           # kick swing active
         self.is_special = False           # astral move in progress
         self.on_ground = True             # grounded contact flag
+
+        # ================= ULTIMATE ABILITY SYSTEM STATE ================
+        # A second, far more devastating astra that only awakens when the
+        # warrior is cornered: HP below 30% AND the astral meter full.
+        # Pressed with V (P1) or commanded by the AI brain for P2.
+        self.ultimate_meter = 0.0         # 0..100 charge of the ultimate
+        self.ultimate_ready = False       # True while conditions are met
+        self.ultimate_cooldown = 0        # frames before it can fire again
+        self.ultimate_used = False        # Karna's Vasavi Shakti: once/match
+        self.ult_active = None            # dict describing the live effect
+        self._ult_credit = []             # instant-hit damage needing credit
 
     # ------------------------------------------------------------------
     # COMBAT TIMING CONSTANTS (per spec)
@@ -1255,14 +1267,14 @@ class Fighter:
         """Walk left at this warrior's own speed (locked during attacks)."""
         if self._busy():
             return
-        self.x -= self.speed
+        self.x -= self.effective_speed      # PASSIVE: Abhimanyu +20%
         self.state = "walk"
         self._clamp_to_stage()
 
     def move_right(self):
         if self._busy():
             return
-        self.x += self.speed
+        self.x += self.effective_speed      # PASSIVE: Abhimanyu +20%
         self.state = "walk"
         self._clamp_to_stage()
 
@@ -1605,16 +1617,367 @@ class Fighter:
         finish(flash_frames=0)
 
     def current_damage(self):
-        """Damage table straight from the CHARACTERS database."""
-        if self.state == "punch":
-            return self.punch_damage
-        if self.state == "kick":
-            return self.kick_damage
-        return self.special_damage
+        """Damage table straight from the CHARACTERS database, scaled by
+        this warrior's passive (Bhima +15% melee) and any active ultimate
+        buff (Bhishma x2 during ICCHA MRITYU, Yudhishthira +50%)."""
+        base = self.punch_damage if self.state == "punch" else \
+            self.kick_damage if self.state == "kick" else self.special_damage
+        return max(1, int(round(base * self.damage_boost())))
 
     def attack_range(self):
         """Melee reach depends on the strike — kicks travel further."""
         return 70 if self.state == "punch" else 95
+
+    # ==================================================================
+    # UNIQUE SPECIAL POWERS & UPGRADED ABILITIES SYSTEM
+    #   * every warrior owns a PASSIVE that is always active
+    #   * every warrior owns an ULTIMATE that awakens at HP < 30% while
+    #     the astral meter is FULL (V key for P1, brain-driven for CPU)
+    # ==================================================================
+    ULT_HP_THRESHOLD = 0.30      # ultimate needs HP below 30% ...
+    ULT_COOLDOWN_FRAMES = 600    # ... and then rests for 10 seconds
+    ULT_CAST_FRAMES = 24         # channel time before the effect fires
+
+    # ---- STEP 1: the second special (ULTIMATE) per character ----------
+    ULTIMATES = {
+        "ARJUNA": dict(
+            name="PASHUPATASTRA", damage=50, kind="cosmic_beam",
+            color=(210, 235, 255), unblockable=True, dialogue=
+            "Mahadev! Grant me the Pashupatastra!", desc=
+            "Shiva's ultimate weapon — a cosmic beam across the whole sky."),
+        "KARNA": dict(
+            name="VASAVI SHAKTI", damage=55, kind="spear",
+            color=(255, 210, 90), unblockable=False, once_per_match=True,
+            dialogue="This spear was meant for Arjuna... now you face it!",
+            desc="Indra's one-time divine spear — instant, piercing death."),
+        "BHIMA": dict(
+            name="RUDRA TANDAV", damage=45, kind="radial_shock",
+            color=(220, 70, 40), unblockable=False, hits=3, dialogue=
+            "I will drink Duryodhana's blood! RUDRA!", desc=
+            "Dance of destruction — an eight-direction shockwave that cracks earth."),
+        "DURYODHANA": dict(
+            name="GADA PRALAYA", damage=48, kind="aoe_slam",
+            color=(170, 70, 220), unblockable=False, dialogue=
+            "I am the king of kings! Bow before me!", desc=
+            "Mace apocalypse — leap skyward, slam down in a huge purple ring."),
+        "BHISHMA PITAMAH": dict(
+            name="ICCHA MRITYU", damage=0, kind="invincible_buff",
+            color=(220, 225, 235), unblockable=True, duration=300, dialogue=
+            "I choose when to fall. Not today!", desc=
+            "Death at will — five seconds invincible with double damage."),
+        "ABHIMANYU": dict(
+            name="CHAKRAVYUHA MASTER", damage=10, kind="multi_hit",
+            color=(90, 235, 255), unblockable=False, hits=7, interval=6,
+            dialogue="Father taught me to enter... now I know how to destroy!",
+            desc="Breaks all defences — seven sword slashes, 70 total damage."),
+        "DRONACHARYA": dict(
+            name="BRAHMASTRA", damage=50, kind="fireball",
+            color=(90, 235, 110), unblockable=False, splash=15, dialogue=
+            "I taught you this weapon... now feel its true power!",
+            desc="A green fireball that detonates with secondary blast damage."),
+        "ASHWATTHAMA": dict(
+            name="NARAYANASTRA UNLEASHED", damage=8, kind="arrow_rain",
+            color=(235, 60, 60), unblockable=False, hits=10, interval=12,
+            dialogue="My curse becomes your doom!",
+            desc="Ten rain-arrows over two seconds under a crimson sky."),
+        "YUDHISHTHIRA": dict(
+            name="SATYA VACHAN", damage=0, kind="heal_buff",
+            color=(255, 225, 120), unblockable=True, heal=40, buff=0.5,
+            duration=600, dialogue="In the name of Dharma, I shall not fall!",
+            desc="Power of truth — heals 40 HP and boosts damage by 50%."),
+        "SHAKUNI": dict(
+            name="MAYA CHAKRA", damage=30, kind="illusion_storm",
+            color=(120, 235, 120), unblockable=False, copies=5, scramble_ms=5000,
+            dialogue="The dice have decided your fate!",
+            desc="Five illusion copies strike at once and scramble your inputs."),
+    }
+    DEFAULT_ULTIMATE = dict(
+        name="DIVINE WRATH", damage=45, kind="radial_shock",
+        color=GOLD, unblockable=False, dialogue="THIS ENDS YOU!",
+        desc="A surge of raw divine fury.")
+
+    @classmethod
+    def get_ultimate(cls, name):
+        """Fetch this warrior's ultimate recipe (safe fallback)."""
+        return cls.ULTIMATES.get(name, cls.DEFAULT_ULTIMATE)
+
+    # ---- STEP 2: passive abilities ------------------------------------
+    def _passive(self, tag, default):
+        """Look up a passive multiplier / flag for this warrior."""
+        p = {
+            # ARJUNA  : +10% astral meter from attacks
+            "meter_gain": {"ARJUNA": 1.10}.get(self.name, 1.0),
+            # KARNA   : Kavach-Kundal — takes 20% less damage
+            "damage_taken": {"KARNA": 0.80}.get(self.name, 1.0),
+            # BHIMA   : +15% punch/kick damage
+            "melee_damage": {"BHIMA": 1.15}.get(self.name, 1.0),
+            # YUDHISHTHIRA : blocks 30% harder than everyone else
+            "block_reduction": {"YUDHISHTHIRA": 1.30}.get(self.name, 1.0),
+            # DRONA   : projectiles fly 50% faster
+            "proj_speed": {"DRONACHARYA": 1.50}.get(self.name, 1.0),
+            # ABHIMANYU : 20% faster movement
+            "speed": {"ABHIMANYU": 1.20}.get(self.name, 1.0),
+        }
+        return p.get(tag, default)
+
+    @property
+    def effective_speed(self):
+        """Movement speed after the character's passive bonus."""
+        return self.speed * self._passive("speed", 1.0)
+
+    def passive_dodge_roll(self):
+        """SHAKUNI: 25% chance to slip any incoming blow entirely."""
+        if self.name != "SHAKUNI" or self.state == "ko":
+            return False
+        return random.random() < 0.25
+
+    def stun_immune(self):
+        """ASHWATTHAMA: the cursed immortal shrugs off all stun effects."""
+        return self.name == "ASHWATTHAMA"
+
+    def block_reduction(self):
+        """Fraction of damage absorbed while guarding (Yudhishthira +30%)."""
+        return min(0.95, self.BLOCK_REDUCTION *
+                   self._passive("block_reduction", 1.0))
+
+    def damage_boost(self):
+        """Extra melee damage multiplier from active ultimates/buffs
+        (Bhishma's ICCHA MRITYU doubles output, Yudhishthira +50%)."""
+        mult = self._passive("melee_damage", 1.0)
+        u = self.ult_active
+        if u and u["kind"] == "invincible_buff":
+            mult *= 2.0
+        if u and u["kind"] == "heal_buff":
+            mult *= 1.0 + u.get("buff", 0.0)
+        return mult
+
+    def invincible(self):
+        """True while Bhishma's ICCHA MRITYU keeps him untouchable."""
+        u = self.ult_active
+        return bool(u and u["kind"] == "invincible_buff")
+
+    # ---- ULTIMATE readiness / activation ------------------------------
+    def can_use_ultimate(self):
+        """Conditions: HP < 30%, astral meter full, off cooldown, alive.
+        Karna's Vasavi Shakti may only be used ONCE per match."""
+        try:
+            if self.health <= 0 or self.state == "ko":
+                return False
+            if self.ult_active is not None or self.is_channeling:
+                return False
+            if self.ultimate_cooldown > 0:
+                return False
+            if self.special_meter < 100:
+                return False
+            if self.max_health > 0 and \
+                    self.health > self.max_health * self.ULT_HP_THRESHOLD:
+                return False
+            ult = self.get_ultimate(self.name)
+            if ult.get("once_per_match") and self.ultimate_used:
+                return False
+            return self.state in ("idle", "walk", "crouch", "jump")
+        except Exception:                      # never crash mid-fight
+            return False
+
+    def start_ultimate(self, opponent=None, fx=None):
+        """Unleash the ULTIMATE ABILITY. Returns True on success.
+
+        Drains the astral meter, arms super armour through the cast,
+        spawns 100+ particles, screen flash/shake/tint and hands the
+        fight scene a slow-mo + camera-zoom request via `ult_active`."""
+        try:
+            if not self.can_use_ultimate():
+                return False
+            ult = self.get_ultimate(self.name)
+            if fx is None:
+                fx = ParticleSystem()
+            self.special_meter = 0.0
+            self.ultimate_meter = 0.0
+            self.ultimate_ready = False
+            self.ultimate_used = True if ult.get("once_per_match") \
+                else self.ultimate_used
+            self.ultimate_cooldown = self.ULT_COOLDOWN_FRAMES
+            play_sound("special_" + self.name.lower())
+            play_sound("ko")                   # heavy impact sting
+            # dramatic freeze + zoom handled by the fight scene reading
+            # ult_active["frames"]; here we just arm the channel window.
+            self.state = "punch"
+            self.attack_total = self.ULT_CAST_FRAMES
+            self.state_timer = self.ULT_CAST_FRAMES
+            self._cast_frames = self.ULT_CAST_FRAMES
+            self.attack_hit = True
+            self.is_channeling = True
+            foot_y = GROUND_Y - self.y
+            cx, cy = self.x, foot_y - 100
+            fx.create_divine_burst(cx, cy, ult["color"], count=60)
+            fx.spawn(cx, cy, GOLD, count=45, speed=9, life=40, size=6,
+                     ptype="divine")
+            fx.flash(10)
+            fx.shake(30, 14)
+            fx.tint(ult["color"], 26)
+            fx.freeze(8)
+            self.ult_active = {
+                "kind": ult["kind"], "name": ult["name"],
+                "damage": ult["damage"], "color": ult["color"],
+                "unblockable": ult.get("unblockable", False),
+                "hits": ult.get("hits", 1), "interval": ult.get("interval", 8),
+                "duration": ult.get("duration", 0),
+                "heal": ult.get("heal", 0), "buff": ult.get("buff", 0.0),
+                "splash": ult.get("splash", 0),
+                "copies": ult.get("copies", 0),
+                "scramble_ms": ult.get("scramble_ms", 0),
+                "life": ult.get("duration", 0) or 90,
+                "timer": self.ULT_CAST_FRAMES,   # delay before first hit
+                "next_hit": self.ULT_CAST_FRAMES,
+                "hit_count": 0,
+                "x": float(self.x), "y": float(foot_y),
+                "target_x": float(opponent.x) if opponent else float(self.x),
+                "zoom": 1.0,
+            }
+            # Buff-type ultimates resolve instantly (no travelling hitbox)
+            if ult["kind"] in ("invincible_buff", "heal_buff"):
+                self._resolve_buff_ultimate(opponent, fx)
+            elif ult["kind"] == "cosmic_beam":
+                self._ult_instant_strike(opponent, ult["damage"], fx,
+                                         unblockable=True)
+            elif ult["kind"] == "spear":
+                self.projectiles.append(self._make_projectile(
+                    self.x + self.facing * 40, foot_y - 110,
+                    dx=self.facing * 22 * self._passive("proj_speed", 1.0),
+                    damage=ult["damage"], shape="spear", scale=1.6))
+            elif ult["kind"] == "fireball":
+                self.projectiles.append(self._make_projectile(
+                    self.x + self.facing * 40, foot_y - 100,
+                    dx=self.facing * 12 * self._passive("proj_speed", 1.0),
+                    damage=ult["damage"], shape="fireball", scale=1.8))
+            elif ult["kind"] == "radial_shock":
+                self._ult_radial(opponent, ult, fx)
+            elif ult["kind"] == "aoe_slam":
+                self._ult_slam(opponent, ult, fx)
+            elif ult["kind"] == "illusion_storm":
+                self._ult_illusion_storm(opponent, ult, fx)
+            return True
+        except Exception as exc:               # STEP 6: never crash
+            print(f"[ultimate-guard] {self.name}: {exc!r}")
+            return False
+
+    # ---- individual ultimate resolvers --------------------------------
+    def _ult_instant_strike(self, opponent, dmg, fx, unblockable=False):
+        """Strike the foe immediately (used by beams / multi-hits)."""
+        if opponent is None or opponent.state == "ko":
+            return 0
+        if not unblockable and opponent.passive_dodge_roll():
+            fx.add_spark(opponent.x, GROUND_Y - opponent.y - 100, 12, WHITE)
+            return 0
+        applied = opponent.take_hit(dmg, self)
+        self._ult_credit.append(applied)
+        fx.create_hit_sparks(opponent.x, GROUND_Y - opponent.y - 100,
+                             self.get_ultimate(self.name)["color"], count=20)
+        return applied
+
+    def _ult_radial(self, opponent, ult, fx):
+        """RUDRA TANDAV — eight-way shockwave; ground/air both covered."""
+        for ang in range(0, 360, 45):
+            r = math.radians(ang)
+            fx.emit(self.x, GROUND_Y - self.y - 60,
+                    math.cos(r) * 10, math.sin(r) * 10,
+                    ult["color"], 34, 7, 0.05, "energy")
+        fx.shake(26, 13)
+        dist = abs(opponent.x - self.x) if opponent else 9999
+        if opponent is not None and dist < 260:
+            total = ult["damage"] // max(1, ult.get("hits", 1))
+            for _ in range(ult.get("hits", 1)):
+                self._ult_instant_strike(opponent, total, fx)
+
+    def _ult_slam(self, opponent, ult, fx):
+        """GADA PRALAYA — leap + massive AOE ring at the landing spot."""
+        self.vy = 14
+        self.y = max(self.y, 1)
+        fx.shake(30, 16)
+        if opponent is not None and abs(opponent.x - self.x) < 220:
+            self._ult_instant_strike(opponent, ult["damage"], fx)
+
+    def _ult_illusion_storm(self, opponent, ult, fx):
+        """MAYA CHAKRA — copies + scrambled controls + combined damage."""
+        if opponent is not None:
+            opponent.controls_reversed_until = \
+                pygame.time.get_ticks() + ult.get("scramble_ms", 5000)
+            self._ult_instant_strike(opponent, ult["damage"], fx)
+        fx.tint((40, 200, 90), 40)
+
+    def _resolve_buff_ultimate(self, opponent, fx):
+        """Instant self-buff ultimates (ICCHA MRITYU / SATYA VACHAN)."""
+        u = self.ult_active
+        if u["kind"] == "heal_buff":
+            self.health = min(self.max_health, self.health + u["heal"])
+            self.display_health = float(self.health)
+            fx.spawn(self.x, GROUND_Y - self.y - 120, GOLD, count=50,
+                     speed=4, life=50, size=6, ptype="divine")
+        u["timer"] = 0          # buffs live purely off their duration
+
+    def _update_ultimate(self):
+        """Per-frame upkeep: readiness flag, cooldown, timed multi-hits."""
+        self.ultimate_ready = self.can_use_ultimate() or \
+            (self.ultimate_cooldown == 0 and self.special_meter >= 100 and
+             0 < self.health <= self.max_health * self.ULT_HP_THRESHOLD)
+        # Ultimate meter mirrors the gate so the HUD third bar can show
+        # progress: 0 -> partial meter, 100 -> conditions satisfied.
+        if self.special_meter >= 100 and \
+                self.health <= self.max_health * self.ULT_HP_THRESHOLD:
+            self.ultimate_meter = 100.0
+        else:
+            hp_part = 0.0
+            if self.health <= self.max_health * self.ULT_HP_THRESHOLD:
+                hp_part = 50.0
+            self.ultimate_meter = hp_part + (self.special_meter / 100.0) * 50.0
+        if self.ultimate_cooldown > 0:
+            self.ultimate_cooldown -= 1
+        # Bhishma: regenerates 1 HP per second (passive)
+        if self.name == "BHISHMA PITAMAH" and 0 < self.health < self.max_health:
+            self.passive_timer += 1
+            if self.passive_timer >= 60:
+                self.passive_timer = 0
+                self.health = min(self.max_health, self.health + 1)
+        u = self.ult_active
+        if u is None:
+            return
+        u["life"] -= 1
+        u["timer"] -= 1
+        u["x"] = self.x
+        u["y"] = GROUND_Y - self.y
+        u["target_x"] = u.get("target_x", self.x)
+        # ---- timed multi-hit ultimates (ABHIMANYU / ASHWATTHAMA) ------
+        if u["kind"] in ("multi_hit", "arrow_rain") and \
+                u["timer"] <= u["next_hit"]:
+            opp = getattr(self, "_ult_opponent", None)
+            if opp is not None and opp.state != "ko" and u["life"] > 0:
+                fx = self.fx or ParticleSystem()
+                if u["kind"] == "multi_hit":
+                    self._ult_instant_strike(opp, u["damage"], fx)
+                    u["color_trail"] = True
+                else:
+                    ax = opp.x + random.uniform(-40, 40)
+                    fy = GROUND_Y - opp.y - 100
+                    if random.random() < 0.7:
+                        self._ult_instant_strike(opp, u["damage"], fx)
+                    fx.spawn(ax, 0, (255, 120, 60), count=6, speed=6,
+                             life=20, size=4, gravity=0.6, ptype="fire")
+                    fx.add_spark(ax, fy, 12, u["color"])
+                u["hit_count"] += 1
+                u["next_hit"] = u["timer"] + u["interval"]
+                if u["hit_count"] >= u["hits"]:
+                    u["life"] = min(u["life"], 20)
+        if u["kind"] in ("invincible_buff", "heal_buff") and u["life"] <= 0:
+            self.ult_active = None
+        elif u["life"] <= 0:
+            self.ult_active = None
+
+    def clear_ultimate(self):
+        """Drop all ultimate state (round reset / new bout)."""
+        self.ult_active = None
+        self._ult_credit.clear()
+        self.ultimate_cooldown = 0
+        self.ultimate_ready = False
 
     # ---------- combat: receiving damage ----------
     def take_hit(self, dmg, attacker=None):
@@ -1636,10 +1999,26 @@ class Fighter:
         if self.state == "ko":
             return 0
         facing_in = attacker.facing if attacker is not None else self._last_attacker_facing(attacker)
-        blocked = (self.state == "block") or \
-                  (self.state == "crouch" and attacker is not None and
-                   abs(self.x - attacker.x) < 140 and
-                   attacker.state == "kick")   # crouching ducks punches
+        # ---- ULTIMATE ABILITY SYSTEM: incoming-damage passives ------
+        # Bhishma's ICCHA MRITYU makes every blow bounce off; Shakuni's
+        # cunning slips 25% of all attacks entirely; an unblockable
+        # ultimate (Pashupatastra etc.) simply ignores the guard.
+        unblockable = bool(getattr(attacker, "_ult_unblockable", False)) \
+            if attacker is not None else False
+        if self.invincible():          # ICCHA MRITYU: blows bounce off
+            if self.fx is not None:
+                self.fx.add_spark(self.x, GROUND_Y - self.y - 100,
+                                  10, WHITE)
+            return 0
+        if self.passive_dodge_roll():
+            if self.fx is not None:
+                self.fx.create_hit_sparks(self.x, GROUND_Y - self.y - 100,
+                                          WHITE, count=8)
+            return 0
+        blocked = ((self.state == "block") or
+                   (self.state == "crouch" and attacker is not None and
+                    abs(self.x - attacker.x) < 140 and
+                    attacker.state == "kick")) and not unblockable
 
         chest_y = GROUND_Y - self.y - 100      # impact point for fx
 
@@ -1653,7 +2032,7 @@ class Fighter:
             blocked = False
 
         if blocked:
-            applied = max(1, int(round(dmg * (1.0 - self.BLOCK_REDUCTION))))
+            applied = max(1, int(round(dmg * (1.0 - self.block_reduction()))))
             self.health = max(0, self.health - applied)
             self.block_stun = self.BLOCK_STUN_FRAMES      # 10 frozen frames
             self.vx = facing_in * 3                        # small push-back
@@ -1674,6 +2053,9 @@ class Fighter:
         play_sound("hit")
 
         applied = int(dmg)
+        # PASSIVE: Karna's Kavach-Kundal absorbs 20% of all incoming harm
+        applied = max(1, int(round(applied *
+                                   self._passive("damage_taken", 1.0))))
         self.health = max(0, self.health - applied)
         # SPECIAL METER also charges while RECEIVING damage (comeback astras)
         self.special_meter = min(100.0,
@@ -1715,6 +2097,10 @@ class Fighter:
                 if self.fx is not None:
                     self.fx.create_hit_sparks(self.x + facing_in * 26,
                                               chest_y, GOLD, count=10)
+            elif self.stun_immune():
+                # PASSIVE: Ashwatthama never flinches — only pushed back
+                self.vx = facing_in * 3
+                self.vy = 0
             else:
                 self.state = "hurt"                            # hit stun
                 self.state_timer = self.HIT_STUN
@@ -1828,6 +2214,8 @@ class Fighter:
     def update(self, opponent):
         """One simulation step for this fighter (called once per frame)."""
         self._sync_flags()          # BUG-FIX: flags always fresh & defined
+        # ---- ULTIMATE ABILITY SYSTEM per-frame upkeep ----
+        self._update_ultimate()
         # --- jump / gravity physics ---
         self.apply_gravity()
 
@@ -1912,7 +2300,9 @@ class Fighter:
         """Damage system: attacker charges the astral meter at 1.5x the
         damage actually dealt (capped at 100)."""
         self.special_meter = min(100.0,
-                                 self.special_meter + dmg * self.METER_GAIN)
+                                 self.special_meter +
+                                 dmg * self.METER_GAIN *
+                                 self._passive("meter_gain", 1.0))
 
     # ------------------------------------------------------------------
     # SPECIAL MOVES SYSTEM — per-frame upkeep for lingering astral fx
@@ -2281,6 +2671,51 @@ class Fighter:
         draw_centered_text(target, label, FONT_SMALL, WHITE, cx,
                            foot_y - STAND_HEIGHT - 38, shadow=True)
 
+    def _draw_character_aura(self, target):
+        """CHARACTER-SPECIFIC AURA — each warrior radiates their own sign:
+          Arjuna : blue energy wisps      Karna : golden sun rays
+          Bhima  : red rage steam         Ashwatthama : dark-red gem glow
+        Drawn behind the body so it reads as an emanation, not a sticker."""
+        if self.state == "ko":
+            return
+        cx = int(self.x)
+        cy = int(GROUND_Y - self.y) - 95
+        t = self.anim_time
+        col = self.special_color
+        try:
+            if self.name == "ARJUNA":                 # blue wisps
+                for i in range(3):
+                    a = t * 0.06 + i * 2.1
+                    wx = cx + math.cos(a) * 34
+                    wy = cy + math.sin(a * 1.7) * 46
+                    _glow(target, wx, wy, 10, (60, 120, 255), 90)
+            elif self.name == "KARNA":                # golden sun rays
+                for i in range(8):
+                    a = t * 0.02 + i * math.tau / 8
+                    x2 = cx + math.cos(a) * (52 + 6 * math.sin(t * 0.1 + i))
+                    y2 = cy + math.sin(a) * (52 + 6 * math.sin(t * 0.1 + i))
+                    pygame.draw.line(target, (255, 210, 90),
+                                     (cx + math.cos(a) * 30,
+                                      cy + math.sin(a) * 30), (x2, y2), 2)
+            elif self.name == "BHIMA":                # red rage steam
+                for i in range(4):
+                    rise = (t * 1.4 + i * 26) % 90
+                    sx = cx + math.sin((t + i * 30) * 0.08) * 16
+                    alpha = max(0, int(110 - rise * 1.2))
+                    if alpha:
+                        g = pygame.Surface((26, 26), pygame.SRCALPHA)
+                        pygame.draw.circle(g, (200, 60, 40, alpha),
+                                           (13, 13), 10)
+                        target.blit(g, (int(sx) - 13, int(cy + 40 - rise)))
+            elif self.name == "ASHWATTHAMA":          # forehead gem
+                pulse = 0.5 + 0.5 * math.sin(t * 0.15)
+                gy = int(GROUND_Y - self.y) - 148
+                _glow(target, cx, gy, int(8 + 5 * pulse), (220, 30, 30),
+                      int(140 + 80 * pulse))
+                pygame.draw.circle(target, (255, 70, 60), (cx, gy), 4)
+        except Exception as exc:                       # never crash render
+            print(f"[aura-guard] {self.name}: {exc!r}")
+
     def draw(self, target):
         """Draw the warrior, honouring the cinematic `draw_scale`.
 
@@ -2288,6 +2723,8 @@ class Fighter:
         zoom-in; we render the body onto a transparent canvas and scale
         it about the fighter's FEET so the camera push-in never lifts or
         sinks the character off the ground line."""
+        # ---- CHARACTER-SPECIFIC AURA (polish feature 8) --------------
+        self._draw_character_aura(target)
         s = float(getattr(self, "draw_scale", 1.0))
         if abs(s - 1.0) < 0.004:
             self._draw_body(target)
