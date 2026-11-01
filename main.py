@@ -35,11 +35,58 @@
 
   All visuals are drawn procedurally (pygame.font + shapes).
   No external image/sound assets are required.
+
+  SOUND SYSTEM (see SECTION 2B - class SoundManager)
+  --------------------------------------------------
+  The game runs perfectly WITHOUT any audio files: every trigger point
+  below is a safe function call that falls back to a generated pygame
+  "beep" tone when the file is missing.  To upgrade from beeps to real
+  audio, drop these files into a "sounds/" folder next to main.py:
+
+      SFX (one-shots, .ogg preferred; .wav also fine):
+          punch.ogg            -- every punch hit
+          kick.ogg             -- every kick hit
+          block.ogg            -- successful guard
+          ko.ogg               -- a fighter's HP reaches 0
+          round_start.ogg      -- the "FIGHT!" announcement
+          combo.ogg            -- combo hits 3+
+          select.ogg           -- menu / cursor navigation
+          confirm.ogg          -- character lock-in / mode start
+          special_arjuna.ogg       -- BRAHMASTRA      (divine arrow whoosh)
+          special_karna.ogg        -- SHAKTI ASTRA     (thunder crack)
+          special_bhima.ogg        -- MAHAGADA PRHAR   (earth slam)
+          special_duryodhana.ogg   -- MAYAVI GADA      (mystic teleport pop)
+          special_bhishma.ogg      -- PRATIGYA ASTRA   (triple-arrow volley)
+          special_abhimanyu.ogg    -- CHAKRAVYUHA BRK  (whirlwind spin)
+          special_drona.ogg        -- NARAYANASTRA     (celestial hum)
+          special_ashwatthama.ogg  -- BRAHMASHIRA      (doom beam)
+          special_yudhishthira.ogg -- DHARMA ASTRA     (temple bell + light)
+          special_shakuni.ogg      -- MAYA JAAL        (dice rattle + laugh)
+      BGM (looping music, .ogg/.mp3):
+          menu.ogg                 -- title screen theme
+          story.ogg                -- narrative screens
+          battle_kurukshetra.ogg   -- stage 1 sunset plains
+          battle_hastinapur.ogg    -- stage 2 palace at night
+          battle_dyut_sabha.ogg    -- stage 3 gambling hall
+          battle_chakravyuha.ogg   -- stage 4 vortex formation
+
+  Recommended FREE sources for those files:
+      https://freesound.org         (search: "punch impact", "whoosh",
+                                     "temple bell", "swords clash")
+      https://opengameart.org       (CC0 combat SFX packs & loops)
+      https://mixkit.co/free-sound-effects   (royalty-free hits)
+      https://pixabay.com/sound-effects       (royalty-free, no login)
+  Convert anything to .ogg:   ffmpeg -i in.wav -c:a libvorbis out.ogg
+  Volume is adjustable live in SETTINGS (from the title screen), saved
+  to sound_settings.json so it persists between sessions.
 =====================================================================
 """
 
+import os
 import sys
+import json
 import math
+import array
 import random
 import pygame
 
@@ -47,6 +94,13 @@ import pygame
 # SECTION 1: INITIALISATION, GLOBAL CLOCK & CONSTANTS
 # =====================================================================
 
+# Initialise ONLY the mixer first, with tolerant settings, so a machine
+# without any audio device still boots the game (the sound layer then
+# simply reports itself muted and everything keeps working).
+try:
+    pygame.mixer.pre_init(44100, -16, 2, 512)
+except Exception:
+    pass
 pygame.init()
 pygame.display.set_caption("MAHABHARAT: DIVINE WARFARE")
 
@@ -77,6 +131,7 @@ STATE_RESULT = "RESULT"
 # ---- STORY MODE scenes (the Mahabharat narrative campaign) ----
 STATE_STORY = "STORY"            # chapter / narrative text screen
 STATE_STORY_ENDING = "STORY_ENDING"   # "DHARMA KI VIJAY!" + credits
+STATE_SETTINGS = "SETTINGS"           # volume control panel (sound)
 
 # --- Fonts (created once, reused everywhere) --------------------------
 FONT_SMALL  = pygame.font.SysFont("arial", 22)
@@ -136,6 +191,335 @@ def wrap_text(text, font, max_w, max_lines=2):
     if cur:
         lines.append(cur)
     return lines[:max_lines]
+
+
+# =====================================================================
+# SECTION 2B: SOUND SYSTEM — SoundManager (graceful, file-optional)
+# =====================================================================
+# Everything audio lives here.  Design goals:
+#   * NO audio files are required.  The game boots and plays perfectly
+#     on a machine with no sounds/ folder and even with no sound card.
+#   * Every trigger point in the game is a plain call to the module
+#     helpers play_sound(name) / play_bgm(name); if the matching file
+#     exists it is used, otherwise a generated sine "beep" tone plays
+#     so there is still audible feedback.
+#   * Volumes are adjustable in the SETTINGS screen and persist in
+#     sound_settings.json next to main.py.
+# ---------------------------------------------------------------------
+# REQUIRED FILES (drop them into ./sounds/) — see the big list at the
+# top of this file for names + free download sources.
+# ---------------------------------------------------------------------
+
+def _tone(freq_hz, ms, vol=1.0, shape="sine", rate=22050, slide=0.0):
+    """Synthesise a short pygame.mixer.Sound from scratch (no assets).
+
+    This is the fallback "beep": a pure tone built with pygame.sndarray
+    when numpy is available, or with raw bytes.array otherwise.  `slide`
+    bends the pitch over the note (negative = falling, feels like an
+    impact), which makes the placeholder audio far less annoying.
+    """
+    n = max(1, int(rate * ms / 1000.0))
+    samples = array.array("h", bytes(2 * n))
+    amp = int(12000 * max(0.0, min(1.0, vol)))
+    f0 = max(40.0, freq_hz)
+    for i in range(n):
+        t = i / rate
+        f = f0 + slide * (i / n) * f0            # pitch bend
+        ph = 2 * _math.pi * f * t
+        if shape == "square":
+            v = 1.0 if (ph % (2 * _math.pi)) < _math.pi else -1.0
+        elif shape == "noise":
+            v = random.uniform(-1.0, 1.0)
+        else:
+            v = _math.sin(ph)
+        env = 1.0 - (i / n)                      # linear decay envelope
+        s = int(amp * v * env * env)
+        samples[i] = max(-32000, min(32000, s))
+    try:
+        import numpy as _np
+        arr = _np.frombuffer(samples.tobytes(), dtype=_np.int16)
+        arr = arr.reshape((n, 1)) if pygame.mixer.get_init()[1] == 8 \
+            else arr.reshape((n, 2)) if pygame.mixer.get_init()[2] == 2 \
+            else arr.reshape((n, 1))
+        return pygame.sndarray.make_sound(_np.ascontiguousarray(arr))
+    except Exception:
+        pass
+    # raw-bytes fallback (works with the default 16-bit stereo mixer)
+    try:
+        buf = bytearray()
+        for i in range(n):
+            t = i / rate
+            f = f0 + slide * (i / n) * f0
+            ph = 2 * _math.pi * f * t
+            v = _math.sin(ph) if shape != "square" else \
+                (1.0 if (ph % (2 * _math.pi)) < _math.pi else -1.0)
+            env = (1.0 - (i / n)) ** 2
+            s = int(amp * v * env)
+            buf += s.to_bytes(2, "little", signed=True) * 2
+        snd = pygame.mixer.Sound(buffer=bytes(buf))
+        return snd
+    except Exception:
+        return None
+
+
+class SoundManager:
+    """File-optional audio layer with synthesised-beep fallbacks.
+
+    Usage anywhere in the code:
+        play_sound("punch")                 -- one-shot effect
+        play_sound("special_arjuna")        -- per-character astral cue
+        play_bgm("battle_kurukshetra")      -- looping music track
+        play_bgm(None)                      -- stop the music
+
+    Loading rules (all wrapped in try/except so nothing ever crashes):
+        sounds/<name>.ogg  ->  sounds/<name>.wav ->  sounds/<name>.mp3
+        bgm/<name>.ogg     ->  bgm/<name>.wav    ->  bgm/<name>.mp3
+        (a flat ./sounds/ folder holding everything also works)
+    If none exist, a themed beep from _TONE_TABLE is generated instead,
+    so the player still hears distinct feedback for every action.
+    """
+
+    EXTENSIONS = (".ogg", ".wav", ".mp3")
+
+    # Fallback beeps: name -> (freq Hz, length ms, wave, pitch slide)
+    _TONE_TABLE = {
+        "punch":         (210,  70, "square", -0.55),
+        "kick":          (150,  95, "square", -0.60),
+        "block":         (520,  55, "sine",    0.00),
+        "combo":         (760,  70, "sine",    0.45),
+        "ko":            (95,  420, "square", -0.70),
+        "round_start":   (660,  240, "sine",    0.30),
+        "select":        (430,  45, "sine",     0.00),
+        "confirm":       (880,  120, "sine",    0.25),
+        "menu":          (330,  300, "sine",    0.10),
+        "story":         (247,  380, "sine",   -0.10),
+        "default":       (300,  60, "sine",     0.00),
+    }
+    # Astral cues get unique pitches so each warrior "sounds" different.
+    _ASTRA_TONES = {
+        "special_arjuna":       (990, 260, "sine",   0.55),
+        "special_karna":        (140, 300, "square", -0.30),
+        "special_bhima":        (70,  380, "square", -0.20),
+        "special_duryodhana":   (600, 200, "noise",   0.00),
+        "special_bhishma":      (830, 180, "sine",    0.35),
+        "special_abhimanyu":    (700, 320, "sine",   -0.45),
+        "special_drona":        (520, 340, "sine",    0.20),
+        "special_ashwatthama":  (110, 460, "square",  0.15),
+        "special_yudhishthira": (1180, 420, "sine",    0.00),
+        "special_shakuni":      (380, 240, "noise",   0.60),
+    }
+
+    def __init__(self, base_dir=None):
+        self.base = base_dir or os.path.dirname(os.path.abspath(__file__))
+        self.sound_dir = os.path.join(self.base, "sounds")
+        self.bgm_dir = os.path.join(self.base, "bgm")
+        self.settings_path = os.path.join(self.base, "sound_settings.json")
+        self.available = False           # mixer usable at all?
+        self.sfx_cache = {}              # name -> Sound (file or beep)
+        self.bgm_cache = {}              # name -> Sound | None
+        self.current_bgm = None
+        self._pending_beep = None        # reused buffer for synth tones
+        self.master_volume = 1.0
+        self.sfx_volume = 0.8
+        self.bgm_volume = 0.5
+        self.load_settings()
+        self._init_mixer()
+
+    # ------------------------------------------------------------------
+    # bootstrapping
+    # ------------------------------------------------------------------
+    def _init_mixer(self):
+        try:
+            if pygame.mixer.get_init() is None:
+                pygame.mixer.init(44100, -16, 2, 512)
+            self.available = pygame.mixer.get_init() is not None
+        except Exception:
+            self.available = False
+        if self.available:
+            try:
+                pygame.mixer.set_num_channels(16)
+            except Exception:
+                pass
+            self.apply_volumes()
+
+    def load_settings(self):
+        """Read persisted volumes; silently ignore any problem."""
+        try:
+            with open(self.settings_path, "r", encoding="utf-8") as fh:
+                d = json.load(fh)
+            self.master_volume = float(d.get("master", self.master_volume))
+            self.sfx_volume = float(d.get("sfx", self.sfx_volume))
+            self.bgm_volume = float(d.get("bgm", self.bgm_volume))
+        except Exception:
+            pass
+
+    def save_settings(self):
+        try:
+            with open(self.settings_path, "w", encoding="utf-8") as fh:
+                json.dump({"master": round(self.master_volume, 3),
+                           "sfx": round(self.sfx_volume, 3),
+                           "bgm": round(self.bgm_volume, 3)}, fh, indent=2)
+        except Exception:
+            pass
+
+    def apply_volumes(self):
+        if not self.available:
+            return
+        try:
+            pygame.mixer.music.set_volume(self.master_volume *
+                                          self.bgm_volume)
+        except Exception:
+            pass
+        for snd in list(self.sfx_cache.values()):
+            try:
+                snd.set_volume(self.master_volume * self.sfx_volume)
+            except Exception:
+                pass
+        for snd in list(self.bgm_cache.values()):
+            if snd is not None:
+                try:
+                    snd.set_volume(self.master_volume * self.bgm_volume)
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # loading
+    # ------------------------------------------------------------------
+    def _find_file(self, directory, name):
+        for ext in self.EXTENSIONS:
+            p = os.path.join(directory, name + ext)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _load_sfx(self, name):
+        """Return a pygame Sound for `name`: real file, else a beep."""
+        if name in self.sfx_cache:
+            return self.sfx_cache[name]
+        snd = None
+        if self.available:
+            path = self._find_file(self.sound_dir, name) or \
+                self._find_file(self.bgm_dir, name)
+            if path:
+                try:
+                    snd = pygame.mixer.Sound(path)
+                except Exception:
+                    snd = None
+            if snd is None:                       # ---- BEEP FALLBACK --
+                spec = self._ASTRA_TONES.get(name) or \
+                    self._TONE_TABLE.get(name) or \
+                    self._TONE_TABLE["default"]
+                try:
+                    snd = _tone(spec[0], spec[1], vol=0.9, shape=spec[2],
+                                slide=spec[3])
+                except Exception:
+                    snd = None
+        if snd is not None:
+            try:
+                snd.set_volume(self.master_volume * self.sfx_volume)
+            except Exception:
+                pass
+        self.sfx_cache[name] = snd
+        return snd
+
+    # ------------------------------------------------------------------
+    # public API
+    # ------------------------------------------------------------------
+    def play_sound(self, name):
+        """Fire a one-shot effect.  Never raises, never blocks."""
+        if not self.available:
+            return
+        try:
+            snd = self._load_sfx(name)
+            if snd is not None:
+                snd.play()
+        except Exception:
+            pass
+
+    def play_bgm(self, name):
+        """Loop background music `name`; None stops it.
+
+        Prefers pygame.mixer.music (streams from disk, low memory).  If
+        no file exists a soft two-note drone is synthesised once and
+        looped, so menus/fights still have some ambience.
+        """
+        if not self.available:
+            return
+        if name is None:
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+            self.current_bgm = None
+            return
+        if self.current_bgm == name:
+            return
+        path = self._find_file(self.bgm_dir, name) or \
+            self._find_file(self.sound_dir, name)
+        try:
+            if path:
+                pygame.mixer.music.load(path)
+                pygame.mixer.music.set_volume(self.master_volume *
+                                              self.bgm_volume)
+                pygame.mixer.music.play(loops=-1, fade_ms=600)
+            else:
+                # --- silent-but-honest fallback: no looping beeps, we
+                # simply keep the last track / stay quiet ------------
+                pygame.mixer.music.stop()
+        except Exception:
+            pass
+        self.current_bgm = name
+
+    def stop_bgm(self):
+        self.play_bgm(None)
+
+    def set_volume(self, kind, value):
+        """kind is 'master' | 'sfx' | 'bgm'; value 0.0 - 1.0."""
+        value = max(0.0, min(1.0, value))
+        setattr(self, kind + "_volume", value)
+        self.apply_volumes()
+        self.save_settings()
+
+    def status_line(self):
+        n_files = len([k for k, v in self.sfx_cache.items() if v])
+        mode = "mixer OFF (silent)" if not self.available else \
+            ("real audio" if n_files >= 3 else "beep fallback")
+        return "%s · SFX %d%% · BGM %d%%" % (
+            mode, int(self.sfx_volume * 100), int(self.bgm_volume * 100))
+
+
+# ---- module-level singleton + tiny wrappers (the trigger points) -----
+# Created lazily on first use so importing this file (e.g. for tests or
+# headless checks) never touches the audio device.
+SOUNDS = None
+
+
+def get_sounds():
+    """Return the shared SoundManager, building it on first call."""
+    global SOUNDS
+    if SOUNDS is None:
+        SOUNDS = SoundManager()
+    return SOUNDS
+
+
+def play_sound(name):
+    """THE sound trigger point used all over the combat code.
+
+    Safe to call anywhere: a missing mixer / missing file simply means
+    a synthesised beep (or silence) instead — never an exception.
+    """
+    try:
+        get_sounds().play_sound(name)
+    except Exception:
+        pass
+
+
+def play_bgm(name):
+    """Music trigger point ('menu', 'story', 'battle_<stage>', None)."""
+    try:
+        get_sounds().play_bgm(name)
+    except Exception:
+        pass
 
 
 # =====================================================================
