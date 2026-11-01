@@ -1859,7 +1859,13 @@ class Fighter:
         self._emit_fx()
 
         # --- AI control for player-less fighters ---
-        if self.controls is None and opponent is not None:
+        # When a professional AIController/AIBrain is attached it owns the
+        # fighter (virtual-key intents injected by FightState), so skip the
+        # legacy built-in brain to avoid double-driving.  The old simple
+        # update_ai() fallback still runs only for fighters with NO brain
+        # at all (e.g. headless demos).
+        if self.controls is None and opponent is not None \
+                and getattr(self, "brain", None) is None:
             self.update_ai(opponent)
 
     # ---------- combo bookkeeping (used by the fight scene) ----------
@@ -2275,6 +2281,31 @@ class Fighter:
         dx = int((pad_x + fx) * (1.0 - s))
         dy = int((pad_top + fy) * (1.0 - s))
         target.blit(zoomed_canvas, (dx, dy))
+
+    # ------------------------------------------------------------------
+    # AI VISUAL INDICATOR (spec STEP 5): small "CPU" tag above the head
+    # with a pulsing gold/red dot so you can see who the machine drives.
+    # Drawn OUTSIDE the zoom canvas so it never scales during cutscenes.
+    # ------------------------------------------------------------------
+    def draw_ai_tag(self, target):
+        if getattr(self, "brain", None) is None or self.state == "ko":
+            return
+        cx = int(self.x)
+        head_y = int(GROUND_Y - self.y) - 138     # just above the crown
+        pulse = 0.5 + 0.5 * math.sin(self.anim_time * 0.12)
+        col = (255, 90, 60) if pulse > 0.5 else GOLD   # red/gold heartbeat
+        tag = FONT_TINY.render("CPU", True, col)
+        tw = tag.get_width()
+        bg = pygame.Surface((tw + 10, tag.get_height() + 4), pygame.SRCALPHA)
+        bg.fill((10, 6, 4, 170))
+        pygame.draw.rect(bg, (*col, 220), bg.get_rect(), 1, border_radius=3)
+        target.blit(bg, (cx - (tw + 10) // 2, head_y - 14))
+        target.blit(tag, (cx - tw // 2, head_y - 12))
+        # blinking activity dot — brighter the harder the difficulty
+        lvl = getattr(self.brain, "level", "MEDIUM")
+        r = {"EASY": 2, "MEDIUM": 3, "HARD": 4}.get(lvl, 3)
+        if pulse > 0.35:
+            pygame.draw.circle(target, col, (cx + tw // 2 + 8, head_y - 5), r)
 
 
 # =====================================================================
@@ -3448,6 +3479,366 @@ class AIBrain:
         self.held = held
 
 
+# ---------------------------------------------------------------------
+# AIController — PROFESSIONAL wrapper around AIBrain (per spec STEP 1)
+# ---------------------------------------------------------------------
+# The spec asks for a class taking (fighter, opponent, difficulty).  It
+# extends AIBrain with the four-zone distance model, HP-driven behaviour
+# phases, optimal-range special usage and the direct-action API
+# (move_left / move_right / jump / crouch / punch / kick / block /
+# use_special).  Everything still funnels through .held virtual keys so
+# the CPU uses the identical input pipeline as the human player.
+AI_ZONES = {
+    "very_far": 400.0,     # >400px : walk toward player, occasional dash
+    "far":      200.0,     # 200-400: cautious approach, prepare to strike
+    "medium":   100.0,     # 100-200: jump in / ranged specials
+    # <100px is the CLOSE zone: attack, combo or block
+}
+AI_HP_PHASES = {"aggressive": 70.0, "balanced": 30.0}   # % of max health
+AI_REACTION_DELAYS = {"EASY": 30, "MEDIUM": 15, "HARD": 5}   # frames
+AI_ATTACK_CHANCE = {"EASY": 0.40, "MEDIUM": 0.60, "HARD": 0.80}
+AI_BLOCK_CHANCE = {"EASY": 0.20, "MEDIUM": 0.50, "HARD": 0.75}
+
+
+class AIController(AIBrain):
+    """Professional AI opponent: distance zones + HP phases + personas.
+
+    Difficulty profiles follow the spec exactly:
+      EASY   reaction delay 30f, attacks 40%, blocks 20%
+      MEDIUM reaction delay 15f, attacks 60%, blocks 50%, uses specials
+      HARD   reaction delay  5f, attacks 80%, blocks 75%, perfect specials
+    """
+
+    def __init__(self, fighter, opponent, difficulty="MEDIUM"):
+        super().__init__(fighter, opponent, difficulty)
+        self.difficulty = self.level          # spec-friendly alias
+        # ---- spec timing knobs ------------------------------------
+        self.reaction_delay = AI_REACTION_DELAYS.get(self.level, 15)
+        self.attack_chance = AI_ATTACK_CHANCE.get(self.level, 0.60)
+        self.block_chance = AI_BLOCK_CHANCE.get(self.level, 0.50)
+        # cadence: one decision every reaction_delay frames (min 5f)
+        self.DECIDE_EVERY = max(5, self.reaction_delay // 3)
+        # HARD gets near-perfect special play (fires whenever it can)
+        if self.level == "HARD":
+            self.p["special_bias"] = 1.6
+            self.p["combo_max"] = 4
+        elif self.level == "EASY":
+            self.p["special_bias"] = 0.5      # wastes/forgets astras
+        # ---- plan bookkeeping ---------------------------------------
+        self.dash_timer = 0                   # frames of dash left
+        self.cautious_timer = 0               # far-zone pacing counter
+        self.last_zone = ""                   # debug / telemetry
+        self.last_phase = "normal"
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    def _zone(self):
+        """Four-band distance check (spec STEP 2.1)."""
+        d = self._distance()
+        if d > AI_ZONES["very_far"]:
+            return "very_far"
+        if d > AI_ZONES["far"]:
+            return "far"
+        if d > AI_ZONES["medium"]:
+            return "medium"
+        return "close"
+
+    def _hp_percent(self):
+        f = self.fighter
+        try:
+            return max(0.0, min(100.0, 100.0 * f.health / max(1, f.max_health)))
+        except Exception:                     # never crash mid-fight
+            return 100.0
+
+    def _phase(self):
+        """HP-based behaviour mode (spec STEP 2.3)."""
+        hp = self._hp_percent()
+        if hp > AI_HP_PHASES["aggressive"]:
+            return "normal"                    # healthy: standard pressure
+        if hp >= AI_HP_PHASES["balanced"]:
+            return "balanced"                  # midway: mix it up + astras
+        return "desperate"                     # <30%: all-or-nothing rush
+
+    def _optimal_range(self):
+        """Range where THIS warrior's astral actually lands."""
+        kind = getattr(getattr(self.fighter, "astra", None), "get",
+                       lambda *_: None)("kind") \
+            if isinstance(getattr(self.fighter, "astra", None), dict) else None
+        name = getattr(self.fighter, "name", "")
+        if kind in ("projectile", "barrage", "disc", "beam"):
+            return 180.0, 520.0                # archers: fire from mid range
+        if "SHAKUNI" in name:
+            return 120.0, 360.0                # trap works at arm's length+
+        if "ABHIMANYU" in name:
+            return 0.0, 120.0                  # vortex needs to be on top
+        return 0.0, 170.0                      # mace/sword melee astras
+
+    def _player_is_dodging(self):
+        o = self.opponent
+        return (o.y < -20 or o.state in ("crouch", "jump")
+                or getattr(o, "dodge_timer", 0) > 0)
+
+    def _player_blocking(self):
+        o = self.opponent
+        return o.state == "block" or getattr(o, "is_blocking", False)
+
+    def _player_hurt(self):
+        o = self.opponent
+        return (getattr(o, "is_hit", False) or o.state == "hurt"
+                or getattr(o, "stun_timer", 0) > 0
+                or getattr(o, "hit_flash", 0) > 6)
+
+    # ------------------------------------------------------------------
+    # DIRECT ACTION API (spec STEP 4)
+    # Every helper adds a small random delay so the CPU never feels like
+    # a metronome; intents still flow through .held -> _apply_ai_input.
+    # ------------------------------------------------------------------
+    def move_left(self):
+        self.held.add("left")
+        self.idle_timer = 0
+
+    def move_right(self):
+        self.held.add("right")
+        self.idle_timer = 0
+
+    def move_toward_player(self):
+        if self.opponent.x < self.fighter.x:
+            self.move_left()
+        else:
+            self.move_right()
+
+    def back_off(self):
+        if self.opponent.x < self.fighter.x:
+            self.move_right()
+        else:
+            self.move_left()
+
+    def dash(self):
+        """Short burst sprint used in the very-far band."""
+        self.dash_timer = random.randint(8, 14)
+        self.move_toward_player()
+
+    def jump(self):
+        self.held.add("up")
+
+    def crouch(self):
+        self.held.add("down")
+
+    def punch(self):
+        self.held.add("punch")
+        self.idle_timer = random.randint(0, 6)     # human-ish follow-up gap
+
+    def kick(self):
+        self.held.add("kick")
+        self.idle_timer = random.randint(2, 9)
+
+    def anti_air(self):
+        """Uppercut-style answer to a leaping opponent: rising kick."""
+        self.kick()
+
+    def block(self):
+        back = "left" if self.fighter.facing > 0 else "right"
+        self.held.update(("down", back))
+
+    def use_special(self):
+        self.held.add("special")
+        self.idle_timer = random.randint(14, 30)   # recover after the cast
+
+    def throw_or_backoff(self):
+        """Vs a blocking player: close in with a heavy kick (grab-ish) or
+        step out — chosen by personality roll."""
+        if random.random() < 0.55:
+            self.plan.append(("kick", 4))           # armour-breaking habit
+        else:
+            self.back_off()
+
+    # ------------------------------------------------------------------
+    # main per-frame brain (spec STEP 2)
+    # ------------------------------------------------------------------
+    def _decide(self):
+        f, o = self.fighter, self.opponent
+        p = self.p
+        dist = self._distance()
+        zone = self._zone()
+        phase = self._phase()
+        self.last_zone, self.last_phase = zone, phase
+        actions = []
+
+        # desperate mode overrides hesitation entirely
+        if phase == "desperate":
+            self.idle_timer = 0
+
+        # ---- 2. PLAYER STATE AWARENESS (react first) ------------------
+        o_attacking = o.state in ("punch", "kick") and not o.attack_hit
+        o_special = getattr(o, "is_channeling", False)
+        o_jumping = o.y < -20
+        react_ok = self.frame % max(1, self.reaction_delay // 3) == 0
+
+        if o_special and random.random() < p["dodge"]:
+            # dodge the astra: hop backwards or duck under it
+            if random.random() < 0.5:
+                self.back_off()
+                self.jump()
+            else:
+                self.crouch()
+            return ["evade"]
+        if o_attacking and dist < 170 and react_ok \
+                and random.random() < self.block_chance:
+            self.block()
+            return ["block"]
+        if o_jumping and dist < 150 and react_ok \
+                and random.random() < p["antiair"]:
+            self.anti_air()
+            return ["antiair"]
+        if self._player_hurt() and dist < 130 and phase != "desperate" \
+                and random.random() < self.attack_chance + 0.2:
+            # punish window: queue a quick 2-4 hit combo
+            for _ in range(random.randint(2, p["combo_max"])):
+                self.plan.append((random.choice(("punch", "kick")), 4))
+            act, n = self.plan.pop(0)
+            (self.punch() if act == "punch" else self.kick())
+            return [act]
+        if self._player_blocking() and dist < 150 and react_ok:
+            self.throw_or_backoff()
+            return ["vs_block"]
+
+        # ---- queued combo still running? ------------------------------
+        if self.plan:
+            act, n = self.plan[0]
+            if act == "wait":
+                if n <= 1:
+                    self.plan.pop(0)
+                else:
+                    self.plan[0] = ("wait", n - 1)
+                return actions
+            actions.append(act)
+            if n <= 1:
+                self.plan.pop(0)
+            else:
+                self.plan[0] = (act, n - 1)
+            return actions
+
+        # ---- 4. SPECIAL USAGE (full meter AND optimal range) ----------
+        lo_rng, hi_rng = self._optimal_range()
+        if f.special_meter >= 100 and lo_rng <= dist <= hi_rng:
+            want = {"normal": 0.45, "balanced": 0.70,
+                    "desperate": 1.00}[phase] * p.get("special_bias", 1.0)
+            if self.level == "HARD":
+                want = 1.0 if phase == "desperate" else max(want, 0.8)
+            if not (self._player_is_dodging() and self.level != "HARD"
+                    and random.random() < 0.6):      # don't waste it
+                if random.random() < want:
+                    self.use_special()
+                    return ["special"]
+
+        # ---- 1. DISTANCE ZONES ----------------------------------------
+        if zone == "very_far":
+            self.move_toward_player()                 # close the gap
+            if random.random() < 0.12:
+                self.dash()                           # occasional dash-in
+            if random.random() < p["jump"] * 0.5:
+                self.jump()
+            actions.append("approach")
+        elif zone == "far":
+            # cautious prodding: step in, stop, re-read the player
+            self.cautious_timer += 1
+            if self.cautious_timer % 3 == 0:
+                self.move_toward_player()
+            elif random.random() < 0.25:
+                self.back_off()
+            if f.special_meter >= 100 and random.random() < 0.25:
+                self.use_special()
+                actions.append("special")
+            actions.append("caution")
+        elif zone == "medium":
+            # jump-ins and ranged pokes
+            if random.random() < p["approach"]:
+                self.move_toward_player()
+            if random.random() < p["jump"] * (1.6 if "ABHIMANYU"
+                                              in getattr(f, "name", "") else 1):
+                self.jump()
+                self.move_toward_player()
+            elif random.random() < 0.35 * self.attack_chance / 0.6:
+                actions.append(random.choice(("punch", "kick")))
+                self.punch() if actions[-1] == "punch" else self.kick()
+            actions.append("mixup")
+        else:  # close (<100px)
+            if phase == "desperate" and f.special_meter >= 100:
+                self.use_special()
+                return ["special_desperate"]
+            if self.idle_timer > 0 and phase != "desperate":
+                self.idle_timer -= self.DECIDE_EVERY
+                if random.random() < 0.30:
+                    self.block()
+                    actions.append("guard")
+            elif random.random() < self.attack_chance:
+                heavy = "BHIMA" in getattr(f, "name", "") or \
+                        "DURYODHANA" in getattr(f, "name", "")
+                for _ in range(random.randint(2, p["combo_max"])):
+                    pick = "kick" if (heavy and random.random() < 0.6) \
+                        else random.choice(("punch", "punch", "kick"))
+                    self.plan.append((pick, 4))
+                    l_, h_ = p["attack_gap"]
+                    self.plan.append(("wait", random.randint(3, 9)))
+                act, n = self.plan.pop(0)
+                actions.append(act)
+                (self.punch() if act == "punch" else self.kick())
+            else:
+                self.back_off()                       # space check
+                actions.append("retreat")
+        return actions
+
+    # ------------------------------------------------------------------
+    # 3. CHARACTER PERSONALITY (spec STEP 3) — richer than the base map
+    # ------------------------------------------------------------------
+    def _apply_personality(self):
+        name = getattr(self.fighter, "name", "")
+        p = self.p
+        if "BHIMA" in name:                # rage rusher, heavy swings
+            p["approach"], p["attack_bias_heavy"] = 0.97, True
+            lo, hi = p["attack_gap"]
+            p["attack_gap"] = (max(5, lo - 7), max(11, hi - 15))
+            p["special_bias"] = 1.3         # mace astra point-blank
+        elif "DURYODHANA" in name:         # aggressive mauler, taunts a lot
+            p["approach"] = 0.93
+            p["attack_bias_heavy"] = True
+            p["taunt"] = True
+        elif "ARJUNA" in name:             # zoner: keeps distance, spams astras
+            p["approach"] = 0.55
+            p["special_bias"] = 1.6
+            p["jump"] = max(p["jump"], 0.18)     # tactical hops
+        elif "KARNA" in name:              # balanced, banks the meter
+            p["special_bias"] = 0.85
+            p["patience"] = True
+        elif "BHISHMA" in name:            # defensive counter-puncher
+            p["block"] = min(0.95, p["block"] + 0.2)
+            p["approach"] = 0.5
+            p["special_bias"] = 1.1
+        elif "ABHIMANYU" in name:          # leaping whirlwind
+            p["jump"] = 0.32
+            p["approach"] = 0.9
+            p["attack_gap"] = (5, 12)
+            p["special_bias"] = 1.2
+        elif "DRONACHARYA" in name:        # patient, calculated, long range
+            p["approach"] = 0.5
+            p["attack_gap"] = tuple(c + 6 for c in p["attack_gap"])
+            p["special_bias"] = 1.25
+        elif "ASHWATTHAMA" in name:        # unpredictable bursts
+            p["erratic"] = True
+            p["approach"] = 0.75
+            p["special_bias"] = 1.15
+        elif "YUDHISHTHIRA" in name:       # honourable: waits for openings
+            p["approach"] = 0.6
+            p["block"] = min(0.95, p["block"] + 0.1)
+            p["patient"] = True
+        elif "SHAKUNI" in name:            # trickster hit-and-run
+            p["approach"] = 0.4
+            p["block"] = min(0.95, p["block"] + 0.15)
+            p["hit_run"] = True
+            p["jump"] = max(p["jump"], 0.2)
+
+
 # =====================================================================
 # SECTION 6: GAME STATES (the state machine scenes)
 # =====================================================================
@@ -4382,12 +4773,13 @@ class FightState(GameState):
         # OVERHAUL STEP 2: the opponent slot is ALWAYS machine-driven now.
         self.f2 = Fighter(p2_data, 900, 0, facing=-1, is_player2=True,
                           controls=None)
-        # ---- AI OPPONENT SYSTEM: P2's slot is run by an AIBrain.  The
-        # brain publishes virtual key intents which _apply_ai_input()
-        # folds into the same input pipeline the human player uses.
+        # ---- AI OPPONENT SYSTEM: P2's slot is run by an AIController.
+        # The brain publishes virtual key intents which _apply_ai_input()
+        # folds into the same input pipeline the human player uses.  It
+        # also re-points at the live fighters after every round reset.
         self.ai_level = getattr(game, "ai_level", "MEDIUM")
         self.p2_is_ai = True                    # fixed: no local 2-player
-        self.f2.brain = AIBrain(self.f2, self.f1, self.ai_level)
+        self.f2.brain = AIController(self.f2, self.f1, self.ai_level)
         self.round_start = pygame.time.get_ticks()
         # spawn records so rounds can be reset with pristine fighters
         self.spawn_data = [
@@ -5016,7 +5408,11 @@ class FightState(GameState):
                 # ---- AI OPPONENT SYSTEM: think before the input pass ----
                 for f in (self.f1, self.f2):
                     if getattr(f, "brain", None):
-                        f.brain.update()
+                        try:
+                            f.brain.update()       # never crash mid-fight
+                        except Exception as _exc:  # pragma: no cover
+                            print(f"[ai-guard] {f.name}: {_exc!r}")
+                            f.brain.held.clear()
                 self._process_movement()
                 for _f, _o in ((self.f1, self.f2), (self.f2, self.f1)):
                     try:
@@ -5131,6 +5527,10 @@ class FightState(GameState):
         if old_brain is not None:
             f.brain = old_brain
             old_brain.reset()
+            # keep the brain wired to the LIVE fighter pair after reset —
+            # __dict__ swap replaced self.f2's identity inside the brain
+            old_brain.fighter = f
+            old_brain.opponent = self.f1 if f.is_player2 else self.f2
 
     def _begin_next_round(self):
         """Round interlude ended — restore both warriors and tick the
@@ -5374,6 +5774,12 @@ class FightState(GameState):
         self._draw_battle_stage(world_target)
         self.f1.draw(world_target)
         self.f2.draw(world_target)
+        # ---- AI VISUAL INDICATOR: "CPU" tag floating over the head ----
+        for _f in (self.f1, self.f2):
+            try:
+                _f.draw_ai_tag(world_target)
+            except Exception:               # never crash the render pass
+                pass
 
         # ---- SPECIAL MOVES SYSTEM visuals (all pure pygame shapes) ----
         self._draw_astra_projectiles(world_target)   # arrows/bolts/discs/walls
@@ -5649,9 +6055,14 @@ class FightState(GameState):
         smooth draining fill, colour tiers and 'HP/max' numbers inside."""
         bar_w, bar_h = 400, 30
         # ---- character name above the bar, in the fighter's own colour --
-        name_img = FONT_SMALL.render(
-            ("P1  " if not f.is_player2 else "") + f.name, True,
-            f.color if f.color != WHITE else GOLD)
+        # AI VISUAL INDICATOR (spec STEP 5): the CPU slot shows its level
+        # right next to the health bar, e.g. "AI - HARD".
+        prefix = "P1  " if not f.is_player2 else ""
+        if getattr(f, "brain", None) is not None:
+            lvl = getattr(f.brain, "level", "?")
+            prefix += "AI - %s   " % lvl
+        name_img = FONT_SMALL.render(prefix + f.name, True,
+                                     f.color if f.color != WHITE else GOLD)
         if align_left:
             target.blit(name_img, (x, y - 26))
         else:
