@@ -272,25 +272,176 @@ CROUCH_HEIGHT = 95                    # squashed height while crouching
 BODY_LEFT_MARGIN = 35                 # boundary clamp padding
 
 
-class ParticleSystem:
-    """Lightweight pooled particle engine — pure pygame.draw circles.
+# ---------------------------------------------------------------------
+# PARTICLE AND VISUAL EFFECTS SYSTEM — tunable constants
+# ---------------------------------------------------------------------
+HEAVY_HIT_THRESHOLD = 18      # damage that counts as a "heavy" blow
+HIT_FREEZE_FRAMES = 4         # pause budget on normal hits (3-5 frames)
+FREEZE_PER_PARTICLE = 0.1     # extra freeze frames per spawned particle
+MAX_FREEZE_FRAMES = 8         # hard cap so fights never feel sluggish
+FLASH_FRAMES = 2              # white full-screen flash duration
+FLASH_ALPHA = 150             # peak brightness of the flash overlay
+TINT_FRAMES = 12              # colour-tint veil duration after a special
+AURA_EMISSION_CHANCE = 0.45   # odds/particle of a ready-meter aura puff
+EFFECT_RING_LAYERS = 4        # concentric rings in a divine burst
 
-    Drives every special-move effect: projectile trails, crackling bolts,
-    impact bursts, whirlwind sparks and ground-shockwave dust.
-    Each astral burst spawns 30-50 particles per the design spec."""
+
+class Particle:
+    """ONE particle of the visual-effects engine.
+
+    Properties (exactly per the design spec):
+        x, y            position on the world canvas
+        dx, dy          velocity components (px / frame)
+        color           RGB tuple
+        lifetime        frames remaining before it dies
+        max_lifetime    starting lifetime (drives alpha fade & shrink)
+        size            current radius in px (shrinks as it ages)
+        gravity         downward acceleration added to dy each frame
+        type            one of: "spark" | "energy" | "divine" |
+                        "fire" | "smoke"
+
+    The `type` only changes how the particle behaves and looks:
+        spark   : fast, light gravity, bright core dot
+        energy  : slight buoyancy, plain glowing circle
+        divine  : rises slowly, twinkles, leaves a halo ring
+        fire    : strong buoyancy, shrinks fast, flickers
+        smoke   : very slow drift, expands instead of shrinking
+    """
+
+    __slots__ = ("x", "y", "dx", "dy", "color", "lifetime",
+                 "max_lifetime", "size", "gravity", "type")
+
+    def __init__(self, x, y, dx, dy, color, lifetime, size,
+                 gravity=0.0, ptype="spark"):
+        self.x = float(x)
+        self.y = float(y)
+        self.dx = float(dx)
+        self.dy = float(dy)
+        self.color = color
+        self.lifetime = int(max(1, lifetime))
+        self.max_lifetime = int(max(1, lifetime))
+        self.size = float(max(1.0, size))
+        self.gravity = float(gravity)
+        self.type = ptype
+
+    # ---------- simulation ----------
+    def update(self):
+        """Advance one frame: move, apply gravity/type behaviour,
+        decay the lifetime and shrink the size with it."""
+        self.x += self.dx
+        self.y += self.dy
+        self.dy += self.gravity
+        t = self.type
+        if t == "spark":                     # hot embers fall back down
+            self.dx *= 0.93
+            self.dy *= 0.96
+        elif t == "energy":                  # pure force floats upward
+            self.dy -= 0.06
+            self.dx *= 0.97
+        elif t == "divine":                  # blessed motes rise & twinkle
+            self.dy -= 0.10
+            self.dx *= 0.98
+        elif t == "fire":                    # flames race upward, die fast
+            self.dy -= 0.22
+            self.dx += random.uniform(-0.25, 0.25)
+            self.lifetime -= 1               # burns out quicker
+        elif t == "smoke":                   # smoke drifts and billows
+            self.dx *= 0.96
+            self.dy -= 0.02
+        self.lifetime -= 1
+
+    @property
+    def alive(self):
+        return self.lifetime > 0
+
+    @property
+    def ratio(self):
+        """Fraction of life left — drives both fade-out and shrink."""
+        return self.lifetime / max(1, self.max_lifetime)
+
+    # ---------- rendering ----------
+    def draw(self, target):
+        """Draw as an alpha-faded circle (plus type flourishes)."""
+        r = self.size
+        if self.type != "smoke":             # everything else shrinks
+            r = max(1.0, self.size * self.ratio)
+        else:                                # smoke expands as it fades
+            r = max(1.0, self.size * (1.4 - self.ratio))
+        ri = max(1, int(r))
+        alpha = int(255 * self.ratio)
+        if self.type == "fire":
+            alpha = min(255, int(alpha * 1.25))
+        elif self.type == "smoke":
+            alpha = int(alpha * 0.45)
+        col = self.color
+        if self.type == "fire":              # flame cools toward red
+            col = (col[0], max(40, int(col[1] * self.ratio)),
+                   max(0, int(col[2] * self.ratio)))
+        elif self.type == "smoke":           # smoke greys itself out
+            g = sum(col) // 3
+            col = (g, g, g)
+        surf = pygame.Surface((ri * 2, ri * 2), pygame.SRCALPHA)
+        pygame.draw.circle(surf, (*col, alpha), (ri, ri), ri)
+        if self.type == "spark":             # tiny white-hot core
+            cr = max(1, ri // 2)
+            pygame.draw.circle(surf, (255, 255, 220, min(255, alpha + 40)),
+                               (ri, ri), cr)
+        elif self.type == "divine":          # golden halo ring
+            pygame.draw.circle(surf, (*GOLD, min(200, alpha // 2)),
+                               (ri, ri), ri, 1)
+        elif self.type == "energy":          # brighter rim
+            pygame.draw.circle(surf, (*col, min(255, alpha + 60)),
+                               (ri, ri), max(1, ri // 2))
+        target.blit(surf, (int(self.x) - ri, int(self.y) - ri))
+
+
+class ParticleSystem:
+    """The complete PARTICLE AND VISUAL EFFECTS SYSTEM.
+
+    Owns every live Particle plus three lightweight request queues that
+    let code anywhere in the game (Fighter specials, hit resolution, AI)
+    ask the fight scene for camera work without holding a reference to
+    it.  FightState drains these queues once per frame:
+
+        shake_requests    -> (frames, intensity)   screen shake
+        flash_requests    -> frames                white flash overlay
+        tint_requests     -> (color, frames)       colour-tint veil
+        freeze_requests   -> frames                hit-freeze slow-mo
+        spark_requests    -> (x, y, frames, color) legacy impact sparks
+
+    Effect factory functions (all return the particles they created):
+        create_hit_sparks / create_divine_burst / create_weapon_trail /
+        create_ground_dust / create_blood_splash / create_aura_particles /
+        create_lightning / create_divine_pillar
+    """
 
     def __init__(self):
-        self.particles = []          # dicts: x,y,vx,vy,life,max,color,size
+        self.particles = []          # live Particle objects
         # ---- effect REQUESTS queued for the fight scene ----
-        # specials ask for camera shake / impact sparks through these
-        # lists; FightState consumes them every frame.  This keeps the
-        # particle engine reusable and decoupled from the scene.
         self.shake_requests = []     # (frames, intensity)
         self.spark_requests = []     # (x, y, frames_left, color)
+        self.flash_requests = []     # [frames, ...]
+        self.tint_requests = []      # [(color, frames), ...]
+        self.freeze_requests = []    # [frames, ...]
 
+    # ------------------------------------------------------------------
+    # queue helpers (decoupled requests -> consumed by FightState)
+    # ------------------------------------------------------------------
     def shake(self, frames, intensity):
         """Queue a screen-shake request (duration + pixel amplitude)."""
         self.shake_requests.append((int(frames), int(intensity)))
+
+    def flash(self, frames=FLASH_FRAMES):
+        """Queue a full-screen white flash (big specials / KO)."""
+        self.flash_requests.append(int(frames))
+
+    def tint(self, color, frames=TINT_FRAMES):
+        """Queue a brief full-screen colour veil in `color`."""
+        self.tint_requests.append((tuple(color), int(frames)))
+
+    def freeze(self, frames):
+        """Queue hit-freeze frames (3-5 typical, capped by the scene)."""
+        self.freeze_requests.append(int(frames))
 
     def add_spark(self, x, y, frames=14, color=None):
         """Queue a classic impact spark at (x, y)."""
@@ -305,42 +456,201 @@ class ParticleSystem:
         reqs, self.spark_requests = self.spark_requests, []
         return reqs
 
+    def drain_flashes(self):
+        reqs, self.flash_requests = self.flash_requests, []
+        return reqs
+
+    def drain_tints(self):
+        reqs, self.tint_requests = self.tint_requests, []
+        return reqs
+
+    def drain_freezes(self):
+        reqs, self.freeze_requests = self.freeze_requests, []
+        return reqs
+
+    # ------------------------------------------------------------------
+    # low-level emitter (kept for backwards compatibility with the
+    # SPECIAL MOVES SYSTEM code that already calls fx.spawn(...))
+    # ------------------------------------------------------------------
+    def emit(self, x, y, dx, dy, color, life, size, gravity=0.0,
+             ptype="spark"):
+        """Push one Particle into the pool and return it."""
+        p = Particle(x, y, dx, dy, color, life, size, gravity, ptype)
+        self.particles.append(p)
+        return p
+
     def spawn(self, x, y, color, count=30, speed=6, life=30, size=5,
-              gravity=0.0):
+              gravity=0.0, ptype="energy"):
+        """Radial burst of `count` particles in random directions."""
         count = max(1, int(count))
+        made = []
         for _ in range(count):
             ang = random.uniform(0, math.tau)
             spd = random.uniform(0.25, 1.0) * speed
-            self.particles.append({
-                "x": float(x), "y": float(y),
-                "vx": math.cos(ang) * spd,
-                "vy": math.sin(ang) * spd,
-                "life": int(life * random.uniform(0.6, 1.0)) + 1,
-                "max": life,
-                "color": color,
-                "size": max(1, int(size * random.uniform(0.5, 1.3))),
-                "gravity": gravity,
-            })
+            made.append(self.emit(
+                x, y, math.cos(ang) * spd, math.sin(ang) * spd, color,
+                int(life * random.uniform(0.6, 1.0)) + 1,
+                max(1, int(size * random.uniform(0.5, 1.3))),
+                gravity, ptype))
+        return made
 
+    # ==================================================================
+    # EFFECT FUNCTIONS (spec items 1-8)
+    # ==================================================================
+    def create_hit_sparks(self, x, y, color=None, count=15):
+        """1. Orange/yellow sparks flying out of a normal landed hit."""
+        color = color or SAFFRON
+        made = []
+        for _ in range(count):
+            ang = random.uniform(-math.pi * 0.85, -math.pi * 0.15)
+            spd = random.uniform(3.0, 7.5)
+            c = (random.choice([SAFFRON, GOLD, YELLOW, WHITE])) \
+                if color is None else color
+            made.append(self.emit(x, y, math.cos(ang) * spd,
+                                  math.sin(ang) * spd, c,
+                                  random.randint(10, 20),
+                                  random.uniform(2, 4), 0.35, "spark"))
+        return made
+
+    def create_divine_burst(self, x, y, color, count=40):
+        """2. Expanding ring of coloured energy for special moves.
+
+        Half the particles fly outward along evenly spaced angles (the
+        ring), the rest scatter as an inner blast; the astral's own
+        colour tints the whole thing."""
+        made = []
+        ring_n = max(8, int(count * 0.6))
+        base_ang = random.uniform(0, math.tau)
+        for i in range(ring_n):
+            ang = base_ang + i * (math.tau / ring_n) \
+                + random.uniform(-0.12, 0.12)
+            spd = random.uniform(5.0, 8.5)
+            made.append(self.emit(x, y, math.cos(ang) * spd,
+                                  math.sin(ang) * spd, color,
+                                  random.randint(22, 34),
+                                  random.uniform(4, 7), 0.0, "divine"))
+        for _ in range(count - ring_n):
+            ang = random.uniform(0, math.tau)
+            spd = random.uniform(1.0, 4.5)
+            made.append(self.emit(x, y, math.cos(ang) * spd,
+                                  math.sin(ang) * spd,
+                                  GOLD if random.random() < 0.35 else color,
+                                  random.randint(16, 30),
+                                  random.uniform(3, 6), -0.02, "energy"))
+        return made
+
+    def create_weapon_trail(self, x, y, color):
+        """3. A couple of tiny motes dropped behind a swinging weapon."""
+        made = []
+        for _ in range(random.randint(2, 4)):
+            made.append(self.emit(x + random.uniform(-4, 4),
+                                  y + random.uniform(-4, 4),
+                                  random.uniform(-1.2, 1.2),
+                                  random.uniform(-1.6, 0.4),
+                                  color, random.randint(8, 14),
+                                  random.uniform(2, 3.5), 0.05,
+                                  "energy"))
+        return made
+
+    def create_ground_dust(self, x, y):
+        """5b. Brown dust puff kicked up when a fighter lands."""
+        made = []
+        for _ in range(random.randint(8, 12)):
+            ang = random.uniform(math.pi * 1.05, math.pi * 1.95)
+            spd = random.uniform(1.5, 4.0)
+            shade = random.randint(90, 150)
+            made.append(self.emit(x + random.uniform(-14, 14), y,
+                                  math.cos(ang) * spd,
+                                  math.sin(ang) * spd * 0.6,
+                                  (shade, int(shade * 0.72),
+                                   int(shade * 0.45)),
+                                  random.randint(14, 24),
+                                  random.uniform(3, 6), 0.12, "smoke"))
+        return made
+
+    def create_blood_splash(self, x, y):
+        """6. Mild dark-red droplets on heavy hits (kept subtle)."""
+        made = []
+        for _ in range(random.randint(6, 10)):
+            ang = random.uniform(-math.pi * 0.9, -math.pi * 0.1)
+            spd = random.uniform(2.0, 5.5)
+            made.append(self.emit(x, y, math.cos(ang) * spd,
+                                  math.sin(ang) * spd, DEEP_RED,
+                                  random.randint(10, 18),
+                                  random.uniform(2, 3.5), 0.45, "spark"))
+        return made
+
+    def create_aura_particles(self, fighter):
+        """7. Continuous subtle motes orbiting a fighter whose meter is
+        FULL — the visual cue that their DIVINE POWER is ready."""
+        made = []
+        if fighter is None or fighter.special_meter < 100:
+            return made
+        if random.random() > AURA_EMISSION_CHANCE:
+            return made
+        cx = fighter.x
+        cy = GROUND_Y - fighter.y - 82
+        ang = random.uniform(0, math.tau)
+        rad = random.uniform(30, 48)
+        made.append(self.emit(cx + math.cos(ang) * rad,
+                              cy + math.sin(ang) * rad * 0.8,
+                              math.cos(ang) * 0.4,
+                              -random.uniform(0.3, 1.0),
+                              fighter.special_color,
+                              random.randint(18, 30),
+                              random.uniform(2, 4), -0.01, "divine"))
+        return made
+
+    def create_lightning(self, x1, y1, x2, y2, color=None):
+        """8. Jagged lightning polyline between two points (Karna's
+        SHAKTI ASTRA / Ashwatthama's BRAHMASHIRA crackle).  Returns the
+        segment list so the scene can also stroke it as a shape."""
+        color = color or GOLD
+        steps = max(4, int(((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5 / 18))
+        pts = []
+        for i in range(steps + 1):
+            t = i / steps
+            jx = random.uniform(-10, 10) if 0 < i < steps else 0
+            jy = random.uniform(-8, 8) if 0 < i < steps else 0
+            pts.append((x1 + (x2 - x1) * t + jx,
+                        y1 + (y2 - y1) * t + jy))
+        for i, (px, py) in enumerate(pts):
+            self.emit(px, py, random.uniform(-0.6, 0.6),
+                      random.uniform(-1.2, 0.2), color,
+                      random.randint(6, 14), random.uniform(2, 4),
+                      0.0, "energy")
+        return pts
+
+    def create_divine_pillar(self, x, y, color, height=GROUND_Y):
+        """9. Vertical beam of falling light (Yudhishthira's Dharma
+        Astra) — motes rain from the sky down to the ground line."""
+        made = []
+        for _ in range(random.randint(24, 36)):
+            yy = random.uniform(y - height, y)
+            made.append(self.emit(x + random.uniform(-26, 26), yy,
+                                  random.uniform(-0.5, 0.5),
+                                  random.uniform(4.0, 9.0),
+                                  color if random.random() < 0.6 else GOLD,
+                                  random.randint(12, 26),
+                                  random.uniform(3, 6), 0.05, "divine"))
+        # scorch bloom where the pillar meets the earth
+        made.extend(self.create_divine_burst(x, y, color, count=14))
+        return made
+
+    # ------------------------------------------------------------------
+    # per-frame upkeep
+    # ------------------------------------------------------------------
     def update(self):
         alive = []
         for p in self.particles:
-            p["x"] += p["vx"]
-            p["y"] += p["vy"]
-            p["vy"] += p["gravity"]
-            p["vx"] *= 0.97
-            p["life"] -= 1
-            if p["life"] > 0:
+            p.update()
+            if p.alive:
                 alive.append(p)
         self.particles = alive
 
     def draw(self, target):
         for p in self.particles:
-            r = max(1, int(p["size"] * (p["life"] / max(1, p["max"]))))
-            alpha = int(255 * p["life"] / max(1, p["max"]))
-            surf = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
-            pygame.draw.circle(surf, (*p["color"], alpha), (r, r), r)
-            target.blit(surf, (int(p["x"]) - r, int(p["y"]) - r))
+            p.draw(target)
 
     def clear(self):
         self.particles.clear()
@@ -424,6 +734,12 @@ class Fighter:
         self.illusion_fx = None             # MAYA JAAL decoy copies state
         self._pending_fx_sparks = []        # impact sparks queued by astras
         self._special_credit = []           # dmg values needing meter credit
+        # ---- PARTICLE & VISUAL EFFECTS SYSTEM hooks ------------------
+        # The fight scene assigns its shared ParticleSystem here so the
+        # fighter can emit landing dust, weapon trails and ready-meter
+        # aura motes all over the place without a constructor change.
+        self.fx = None                      # set by FightState per fighter
+        self.was_airborne = False           # for landing-dust detection
 
     # ------------------------------------------------------------------
     # COMBAT TIMING CONSTANTS (per spec)
@@ -605,14 +921,18 @@ class Fighter:
     # ------------------------------------------------------------------
     # SPECIAL MOVES SYSTEM — per-character astral spawner
     # ------------------------------------------------------------------
-    def _make_projectile(self, x, y, vx, vy=0.0, damage=None, shape=None,
+    def _make_projectile(self, x, y, dx, dy=0.0, damage=None, shape=None,
                          scale=1.0):
-        """Build one astral projectile record with its own hitbox size."""
+        """Build one astral projectile record with its own hitbox size.
+
+        Velocity keys are "dx"/"dy" (matching the Particle naming used
+        by the PARTICLE AND VISUAL EFFECTS SYSTEM); legacy "vx"/"vy"
+        spellings are still honoured wherever projectiles are read."""
         a = self.astra
         w, h = a.get("size", (60, 16))
         return {
             "x": float(x), "y": float(y),
-            "vx": vx, "vy": vy,
+            "dx": dx, "dy": dy,
             "w": int(w * scale), "h": int(h * scale),
             "damage": self.special_damage if damage is None else damage,
             "shape": shape or a.get("shape", "arrow"),
@@ -628,8 +948,17 @@ class Fighter:
 
         `fx` is the shared ParticleSystem of the fight scene; when it is
         None a private throw-away system is used so the call never breaks.
-        Every branch spawns 30-50 particles in special_color and requests
-        a screen shake whose intensity scales with the astral's damage."""
+
+        PARTICLE AND VISUAL EFFECTS SYSTEM integration — every astral now:
+          * spawns its signature particle effect through the new factory
+            functions (create_divine_burst / create_lightning /
+            create_divine_pillar / create_ground_dust / create_hit_sparks)
+          * requests a screen SHAKE scaled to the astral's damage
+          * requests a white FLASH overlay (big astras only)
+          * requests a colour TINT veil in its own special_color
+          * requests HIT-FREEZE frames proportional to the particles it
+            created (the slow-mo punch-in on impact)
+        """
         if fx is None:
             fx = ParticleSystem()
         a = self.astra
@@ -639,8 +968,21 @@ class Fighter:
         hand_x = self.x + self.facing * 48
         hand_y = foot_y - 112
         dmg = a.get("damage", self.special_damage)
+        # ---- shake intensity SCALES WITH DAMAGE (spec) ----
+        power = max(4, min(18, int(dmg * 0.55)))
         shake = int(a.get("shake", 10))
-        power = a.get("shake_power", 6)
+        made = []                      # particles created by this astra
+
+        def finish(flash_frames=0, tint=True):
+            """Common tail: queue freeze frames from the particle count,
+            an optional white flash and the astral's colour veil."""
+            fx.freeze(min(MAX_FREEZE_FRAMES,
+                          max(3, int(len(made) * FREEZE_PER_PARTICLE))))
+            if flash_frames:
+                fx.flash(flash_frames)
+            if tint:
+                fx.tint(col, TINT_FRAMES)
+            fx.shake(shake, power)
 
         # ================= PROJECTILE / BARRAGE ASTRAS (archers) ========
         if kind in ("projectile", "barrage"):
@@ -653,15 +995,16 @@ class Fighter:
                     pr = self._make_projectile(hand_x, hand_y + dy * 0.4,
                                                self.facing * speed,
                                                damage=dmg, scale=0.6)
-                    pr["vy"] = dy * 0.012      # gentle vertical fan-out
+                    pr["dy"] = dy * 0.012      # gentle vertical fan-out
                     self.projectiles.append(pr)
             else:
                 self.projectiles.append(
                     self._make_projectile(hand_x, hand_y,
                                           self.facing * speed, damage=dmg))
-            fx.spawn(hand_x, hand_y, col, count=random.randint(30, 50),
-                     speed=7, life=26, size=5)
-            fx.shake(shake, power)
+            # divine ring erupting from the bow-string
+            made.extend(fx.create_divine_burst(hand_x, hand_y, col,
+                                               count=random.randint(30, 50)))
+            finish(flash_frames=FLASH_FRAMES if dmg >= 24 else 0)
             return
 
         # ================= SHOCKWAVE (BHIMA · MAHAGADA PRHAR) ===========
@@ -671,18 +1014,23 @@ class Fighter:
             self.projectiles.append({
                 "x": self.x + self.facing * 60,
                 "y": GROUND_Y - h / 2.0,       # travels ALONG the ground
-                "vx": self.facing * speed, "vy": 0.0,
+                "dx": self.facing * speed, "dy": 0.0,
                 "w": w, "h": h,
                 "damage": dmg, "shape": "wall", "scale": 1.0,
                 "color": col, "trail": "dust",
                 "life": a.get("life", 90),
                 "owner": self, "hit": False,
             })
-            # the ground slam itself: dust burst at the caster's feet
-            fx.spawn(self.x + self.facing * 40, GROUND_Y - 8, col,
-                     count=random.randint(40, 50), speed=9, life=34,
-                     size=6, gravity=0.25)
-            fx.shake(shake, power)             # massive earth-shaking
+            # the ground slam itself: brown dust billowing off the earth
+            made.extend(fx.create_ground_dust(self.x + self.facing * 40,
+                                              GROUND_Y - 6))
+            made.extend(fx.create_ground_dust(self.x + self.facing * 90,
+                                              GROUND_Y - 4))
+            # energy ring blasting out along the surface
+            made.extend(fx.create_divine_burst(self.x + self.facing * 60,
+                                               GROUND_Y - 20, col,
+                                               count=random.randint(30, 45)))
+            finish(flash_frames=FLASH_FRAMES)   # earth-shattering punch-in
             return
 
         # ================= VORTEX (ABHIMANYU · CHAKRAVYUHA BREAKER) =====
@@ -695,34 +1043,40 @@ class Fighter:
                 "hit": False,                   # connects ONCE
                 "angle": 0.0,
             }
-            fx.spawn(self.x, foot_y - 80, col,
-                     count=random.randint(40, 50), speed=8, life=30, size=5)
-            fx.shake(shake, power)
+            made.extend(fx.create_divine_burst(self.x, foot_y - 80, col,
+                                               count=random.randint(40, 50)))
+            finish(flash_frames=FLASH_FRAMES)
             return
 
         # ================= BEAM (ASHWATTHAMA · BRAHMASHIRA) =============
         if kind == "beam":
             self.beam_fx = {"life": a.get("life", BEAM_LIFE),
                             "max": a.get("life", BEAM_LIFE),
-                            "y": foot_y - 100}
+                            "y": foot_y - 100,
+                            "bolt": None}
+            # jagged lightning strobing across the whole arena width
+            made.extend(fx.create_lightning(0, foot_y - 100,
+                                            SCREEN_WIDTH, foot_y - 100, col))
+            self.beam_fx["bolt"] = fx.create_lightning(
+                0, foot_y - 100, SCREEN_WIDTH, foot_y - 100, WHITE)
             # instant full-screen-width strike (meter/combo credited by
             # the fight scene via _finish_special_credit)
             if opponent is not None and opponent.state != "ko":
                 applied = opponent.take_hit(dmg, self)
                 self._special_credit.append(applied)
-                fx.spawn(opponent.x, GROUND_Y - opponent.y - 100, col,
-                         count=random.randint(45, 50), speed=11, life=36,
-                         size=7)
+                made.extend(fx.create_divine_burst(
+                    opponent.x, GROUND_Y - opponent.y - 100, col,
+                    count=random.randint(45, 50)))
+                made.extend(fx.create_blood_splash(
+                    opponent.x, GROUND_Y - opponent.y - 100))
                 # remember where the impact happened for the spark layer
                 self._pending_fx_sparks.append(
                     (opponent.x, GROUND_Y - opponent.y - 100, 18, col))
             # muzzle storm along the beam line
             for xx in range(0, SCREEN_WIDTH, 90):
-                fx.spawn(xx, foot_y - 100, col, count=4, speed=5, life=22,
-                         size=5)
-            fx.spawn(hand_x, hand_y, (255, 255, 255), count=20, speed=9,
-                     life=24, size=6)
-            fx.shake(shake, power)              # 25-frame-class cataclysm
+                made.extend(fx.create_weapon_trail(xx, foot_y - 100, col))
+            made.extend(fx.create_hit_sparks(hand_x, hand_y, WHITE, count=20))
+            finish(flash_frames=FLASH_FRAMES + 2)   # cataclysmic white-out
             return
 
         # ================= PILLAR (YUDHISHTHIRA · DHARMA ASTRA) =========
@@ -740,10 +1094,9 @@ class Fighter:
                     opponent.state_timer += extra
                     opponent.extra_stun = extra
                 self.add_meter(applied)
-            fx.spawn(tx, ty - 60, GOLD, count=random.randint(35, 50),
-                     speed=6, life=40, size=6, gravity=-0.12)
-            fx.spawn(tx, ty - 20, col, count=20, speed=9, life=26, size=5)
-            fx.shake(shake, power)
+            # column of blessed light raining down from the heavens
+            made.extend(fx.create_divine_pillar(tx, ty, col, height=GROUND_Y))
+            finish(flash_frames=FLASH_FRAMES)
             return
 
         # ================= TELEPORT (DURYODHANA · MAYAVI GADA) ==========
@@ -759,16 +1112,21 @@ class Fighter:
                 self.facing = 1 if opponent.x > self.x else -1
                 applied = opponent.take_hit(dmg, self)
                 self.add_meter(applied)
-                fx.spawn(opponent.x, GROUND_Y - opponent.y - 100, col,
-                         count=random.randint(35, 50), speed=9, life=30,
-                         size=6)
+                # illusion burst where he vanished + where he materialised
+                made.extend(fx.create_divine_burst(
+                    self.teleport_fx["from_x"], foot_y - 90, col, count=24))
+                made.extend(fx.create_divine_burst(
+                    opponent.x, GROUND_Y - opponent.y - 100, col,
+                    count=random.randint(30, 40)))
+                made.extend(fx.create_hit_sparks(
+                    opponent.x, GROUND_Y - opponent.y - 100, col, count=15))
                 fx.add_spark(opponent.x, GROUND_Y - opponent.y - 100,
-                             col, 16)
+                             16, col)
             else:
                 self.teleport_fx = {"from_x": self.x, "at_x": self.x,
                                     "life": TELEPORT_FLASH,
                                     "max": TELEPORT_FLASH}
-            fx.shake(shake, power)              # purple illusion flash
+            finish(flash_frames=FLASH_FRAMES)     # purple illusion flash
             return
 
         # ================= ILLUSION (SHAKUNI · MAYA JAAL) ===============
@@ -784,18 +1142,18 @@ class Fighter:
                 opponent.controls_reversed_until = \
                     pygame.time.get_ticks() + dur_ms
             for ox, oy in self.illusion_fx["offsets"]:
-                fx.spawn(self.x + ox, GROUND_Y - self.y - 90 + oy, col,
-                         count=random.randint(12, 16), speed=5, life=30,
-                         size=5)
-            fx.shake(shake, power)
+                made.extend(fx.create_divine_burst(
+                    self.x + ox, GROUND_Y - self.y - 90 + oy, col,
+                    count=random.randint(12, 16)))
+            finish(flash_frames=0)
             return
 
         # ---------- fallback: generic projectile ----------
         self.projectiles.append(
             self._make_projectile(hand_x, hand_y, self.facing * 13,
                                   damage=dmg))
-        fx.spawn(hand_x, hand_y, col, count=30, speed=7, life=24, size=5)
-        fx.shake(shake, power)
+        made.extend(fx.create_divine_burst(hand_x, hand_y, col, count=30))
+        finish(flash_frames=0)
 
     def current_damage(self):
         """Damage table straight from the CHARACTERS database."""
@@ -818,6 +1176,13 @@ class Fighter:
           * HIT       -> white flash 15 frames, hit stun, knockback
                          AWAY from the attacker (slide + slight air pop)
           * health never drops below 0; KO locks the fighter down
+
+        PARTICLE & VISUAL EFFECTS SYSTEM integration (all routed through
+        self.fx so the fight scene drains them as camera requests):
+          * every landed blow throws create_hit_sparks at chest height
+          * HEAVY blows (>= HEAVY_HIT_THRESHOLD damage) add a mild
+            create_blood_splash and queue a 3-5 frame HIT FREEZE
+          * a KO fires a white FLASH overlay plus a violent screen SHAKE
         Returns the damage actually applied (used for sparks/meter)."""
         if self.state == "ko":
             return 0
@@ -827,11 +1192,16 @@ class Fighter:
                    abs(self.x - attacker.x) < 140 and
                    attacker.state == "kick")   # crouching ducks punches
 
+        chest_y = GROUND_Y - self.y - 100      # impact point for fx
+
         if blocked:
             applied = max(1, int(round(dmg * (1.0 - self.BLOCK_REDUCTION))))
             self.health = max(0, self.health - applied)
             self.block_stun = self.BLOCK_STUN_FRAMES      # 10 frozen frames
             self.vx = facing_in * 3                        # small push-back
+            if self.fx is not None:                        # gold guard sparks
+                self.fx.create_hit_sparks(self.x + facing_in * 30,
+                                          chest_y, GOLD, count=8)
             return applied
 
         applied = int(dmg)
@@ -843,11 +1213,28 @@ class Fighter:
         self.hit_flash = self.HIT_FLASH_FRAMES             # flash white 15f
         self.combo_count = 0                               # your own combo dies
         self.combo_timer = 0
+
+        # ---- PARTICLE & VISUAL EFFECTS on a clean hit -----------------
+        if self.fx is not None:
+            self.fx.create_hit_sparks(self.x, chest_y, SAFFRON, count=15)
+            if applied >= HEAVY_HIT_THRESHOLD:     # heavy blow: mild blood
+                self.fx.create_blood_splash(self.x, chest_y)
+                # hit-freeze slow-mo punch-in (3-5 frames, damage-scaled)
+                self.fx.freeze(min(MAX_FREEZE_FRAMES,
+                                   3 + applied // 12))
+
         if self.health <= 0:
             self.state = "ko"
             self.state_timer = 0
             self.vx = facing_in * 7
             self.vy = 4                                    # dramatic pop-up
+            if self.fx is not None:                        # KO spectacle
+                self.fx.flash(FLASH_FRAMES + 2)
+                self.fx.shake(24, 12)
+                self.fx.tint(self.special_color, TINT_FRAMES + 6)
+                self.fx.create_divine_burst(self.x, chest_y,
+                                            self.special_color, count=40)
+                self.fx.freeze(6)
         else:
             self.state = "hurt"                            # hit stun
             self.state_timer = self.HIT_STUN
@@ -874,7 +1261,11 @@ class Fighter:
         Two vertical channels are used:
           vel_y -> the fighter's own jump arc
           vy    -> knockback LIFT pushed by an opponent's strike
-        Both feed the same position and stop dead on the ground line."""
+        Both feed the same position and stop dead on the ground line.
+
+        PARTICLE & VISUAL EFFECTS integration: the exact frame a fighter
+        touches back down after being airborne, create_ground_dust puffs
+        brown smoke off the floor at their feet."""
         airborne = self.y > 0 or self.vel_y != 0 or self.vy != 0
         if airborne:
             self.vel_y -= GRAVITY
@@ -884,6 +1275,23 @@ class Fighter:
                 self.y, self.vel_y, self.vy = 0.0, 0.0, 0.0
                 if self.state == "jump":
                     self.state = "idle"
+                if self.fx is not None:       # landing dust puff
+                    self.fx.create_ground_dust(self.x, GROUND_Y - 4)
+        self.was_airborne = airborne
+
+    def _emit_fx(self):
+        """Per-frame PARTICLE AND VISUAL EFFECTS upkeep for this fighter:
+          * subtle divine aura motes while the astral meter is FULL
+          * weapon trail sparks during the active window of a swing"""
+        fx = self.fx
+        if fx is None:
+            return
+        fx.create_aura_particles(self)
+        if self.is_attack_active():
+            foot_y = GROUND_Y - self.y
+            tip_x = self.x + self.facing * self.attack_range()
+            tip_y = foot_y - (112 if self.state == "punch" else 60)
+            fx.create_weapon_trail(tip_x, tip_y, self.special_color)
 
     def update(self, opponent):
         """One simulation step for this fighter (called once per frame)."""
@@ -939,6 +1347,9 @@ class Fighter:
         # --- advance the animation clock (bobbing / leg cycle) ---
         self.anim_time += 1.0
 
+        # --- PARTICLE & VISUAL EFFECTS upkeep (aura / weapon trails) ---
+        self._emit_fx()
+
         # --- AI control for player-less fighters ---
         if self.controls is None and opponent is not None:
             self.update_ai(opponent)
@@ -970,7 +1381,8 @@ class Fighter:
     def _update_astra_effects(self):
         """Decay the timers of every persistent special effect this
         fighter owns (vortex ring, beam, pillar, teleport flash and
-        Shakuni's illusion copies).  Pure bookkeeping - no drawing."""
+        Shakuni's illusion copies).  Also keeps feeding the continuous
+        PARTICLE & VISUAL EFFECTS while an astral is still on screen."""
         if self.extra_stun > 0:
             self.extra_stun -= 1
         for key in ("vortex", "beam_fx", "pillar_fx", "teleport_fx",
@@ -982,6 +1394,28 @@ class Fighter:
                     fx["angle"] = fx.get("angle", 0.0) + 0.45
                     fx["x"] = self.x          # vortex follows the spinner
                     fx["y"] = GROUND_Y - self.y - 80
+                    # swirling energy wall feeding the whirlwind
+                    if self.fx is not None:
+                        a = fx["angle"]
+                        r = fx["radius"] * (fx["life"] /
+                                            max(1, fx["max_life"]))
+                        self.fx.emit(fx["x"] + math.cos(a) * r,
+                                     fx["y"] + math.sin(a) * r * 0.7,
+                                     math.cos(a + 1.57) * 2.0,
+                                     math.sin(a + 1.57) * 1.4,
+                                     self.special_color, 16, 4,
+                                     0.0, "energy")
+                elif key == "beam_fx" and self.fx is not None:
+                    # strobing lightning re-jagged every few frames
+                    if fx["life"] % 3 == 0:
+                        y = fx["y"]
+                        fx["bolt"] = self.fx.create_lightning(
+                            0, y, SCREEN_WIDTH, y, WHITE)
+                elif key == "pillar_fx" and self.fx is not None:
+                    # curtain of light still raining down while visible
+                    self.fx.create_divine_pillar(
+                        fx["x"], GROUND_Y - self.y, self.special_color,
+                        height=GROUND_Y)
                 if fx["life"] <= 0:
                     setattr(self, key, None)
 
@@ -2402,6 +2836,18 @@ class FightState(GameState):
         self.fx = ParticleSystem()       # shared particles for both sides
         self.shake_frames = 0            # screen-shake budget (frames left)
         self.shake_intensity = 0         # max pixel amplitude right now
+        # ---- PARTICLE AND VISUAL EFFECTS SYSTEM state ----------------
+        # _drain_fx_requests() turns the ParticleSystem's queued requests
+        # into these; draw() renders the flash / tint overlays on top of
+        # everything and update() skips the simulation during hit freeze.
+        self.flash_frames = 0            # white full-screen flash left
+        self.tint_frames = 0             # colour veil frames remaining
+        self.tint_max = 1                # fade denominator for the veil
+        self.tint_color = WHITE          # current veil RGB
+        self.hit_freeze_frames = 0       # simulation-pause frames left
+        self.lightning_bolts = []        # [(points, color, ttl), ...]
+        for f in (self.f1, self.f2):     # wire the shared fx into fighters
+            f.fx = self.fx
         # dramatic pre-fight exchange (2 intro lines from the database)
         intro = (p1_data["intro_dialogue"][0] + "   ||   " +
                  p2_data["intro_dialogue"][0])
@@ -2745,6 +3191,13 @@ class FightState(GameState):
         self.fx.particles.clear()
         self.shake_frames = 0
         self.shake_intensity = 0
+        # PARTICLE & VISUAL EFFECTS: wipe every screen effect for round 2
+        self.flash_frames = 0
+        self.tint_frames = 0
+        self.hit_freeze_frames = 0
+        self.lightning_bolts.clear()
+        for f in (self.f1, self.f2):
+            f.fx = self.fx              # re-wire fresh fighters to the fx
         self._reset_fighter(self.f1, 1)
         self._reset_fighter(self.f2, -1)
         self.round_start = pygame.time.get_ticks()
