@@ -230,6 +230,80 @@ CROUCH_HEIGHT = 95                    # squashed height while crouching
 BODY_LEFT_MARGIN = 35                 # boundary clamp padding
 
 
+class ParticleSystem:
+    """Lightweight pooled particle engine — pure pygame.draw circles.
+
+    Drives every special-move effect: projectile trails, crackling bolts,
+    impact bursts, whirlwind sparks and ground-shockwave dust.
+    Each astral burst spawns 30-50 particles per the design spec."""
+
+    def __init__(self):
+        self.particles = []          # dicts: x,y,vx,vy,life,max,color,size
+        # ---- effect REQUESTS queued for the fight scene ----
+        # specials ask for camera shake / impact sparks through these
+        # lists; FightState consumes them every frame.  This keeps the
+        # particle engine reusable and decoupled from the scene.
+        self.shake_requests = []     # (frames, intensity)
+        self.spark_requests = []     # (x, y, frames_left, color)
+
+    def shake(self, frames, intensity):
+        """Queue a screen-shake request (duration + pixel amplitude)."""
+        self.shake_requests.append((int(frames), int(intensity)))
+
+    def add_spark(self, x, y, frames=14, color=None):
+        """Queue a classic impact spark at (x, y)."""
+        self.spark_requests.append((x, y, int(frames),
+                                    color or GOLD))
+
+    def drain_shakes(self):
+        reqs, self.shake_requests = self.shake_requests, []
+        return reqs
+
+    def drain_sparks(self):
+        reqs, self.spark_requests = self.spark_requests, []
+        return reqs
+
+    def spawn(self, x, y, color, count=30, speed=6, life=30, size=5,
+              gravity=0.0):
+        count = max(1, int(count))
+        for _ in range(count):
+            ang = random.uniform(0, math.tau)
+            spd = random.uniform(0.25, 1.0) * speed
+            self.particles.append({
+                "x": float(x), "y": float(y),
+                "vx": math.cos(ang) * spd,
+                "vy": math.sin(ang) * spd,
+                "life": int(life * random.uniform(0.6, 1.0)) + 1,
+                "max": life,
+                "color": color,
+                "size": max(1, int(size * random.uniform(0.5, 1.3))),
+                "gravity": gravity,
+            })
+
+    def update(self):
+        alive = []
+        for p in self.particles:
+            p["x"] += p["vx"]
+            p["y"] += p["vy"]
+            p["vy"] += p["gravity"]
+            p["vx"] *= 0.97
+            p["life"] -= 1
+            if p["life"] > 0:
+                alive.append(p)
+        self.particles = alive
+
+    def draw(self, target):
+        for p in self.particles:
+            r = max(1, int(p["size"] * (p["life"] / max(1, p["max"]))))
+            alpha = int(255 * p["life"] / max(1, p["max"]))
+            surf = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+            pygame.draw.circle(surf, (*p["color"], alpha), (r, r), r)
+            target.blit(surf, (int(p["x"]) - r, int(p["y"]) - r))
+
+    def clear(self):
+        self.particles.clear()
+
+
 class Fighter:
     """A fully-featured 2D fighting-game character entity."""
 
@@ -291,6 +365,23 @@ class Fighter:
         self.projectiles = []           # this fighter's astral blasts
         self.ai_decision_timer = 0
         self.is_channeling = False        # True while casting the astral weapon
+
+        # =============== SPECIAL MOVES SYSTEM STATE ===================
+        self.astra = get_astra(self.name)   # this warrior's astral recipe
+        # ---- METER GAIN: specials charge by DEALING *and* TAKING damage.
+        # Dealt damage fills at METER_GAIN (1.5x); received damage fills at
+        # a smaller fraction so comeback astras are possible but earned.
+        self.meter_gain_dealt = self.METER_GAIN      # 1.5 x dmg dealt
+        self.meter_gain_taken = 0.9                  # 0.9 x dmg taken
+        self.controls_reversed_until = 0.0  # MAYA JAAL: reversed-input timer
+        self.extra_stun = 0                 # DHARMA ASTRA: bonus stun frames
+        self.vortex = None                  # CHAKRAVYUHA BREAKER active box
+        self.beam_fx = None                 # BRAHMASHIRA beam display state
+        self.pillar_fx = None               # DHARMA ASTRA pillar display state
+        self.teleport_fx = None             # MAYAVI GADA purple flash state
+        self.illusion_fx = None             # MAYA JAAL decoy copies state
+        self._pending_fx_sparks = []        # impact sparks queued by astras
+        self._special_credit = []           # dmg values needing meter credit
 
     # ------------------------------------------------------------------
     # COMBAT TIMING CONSTANTS (per spec)
@@ -442,26 +533,227 @@ class Fighter:
             return
         self.attack_hit = False                      # fresh swing can connect
 
-    def start_special(self):
-        """Unleash the character's signature astral weapon (needs full meter)."""
-        if self.special_meter >= 100 and self.state in ("idle", "walk"):
-            self.special_meter = 0.0
-            self.state = "punch"                 # channeling pose = thrust
-            self.attack_total = 20
-            self.state_timer = 20
-            self.punch_cooldown = max(self.punch_cooldown, 20)
-            self.attack_hit = True               # the melee box must NOT hit
-            self.is_channeling = True
-            foot_y = GROUND_Y - self.y
+    def start_special(self, opponent=None, fx=None):
+        """UNLEASH THE SIGNATURE ASTRAL WEAPON — the heart of the game.
+
+        Requirements: special meter must be FULL (100) and the fighter
+        must be in a neutral stance.  On success the meter drains to 0,
+        the character channels for CAST_FRAMES and the unique effect for
+        this warrior is spawned via _spawn_astra().
+
+        Returns True if the astral was released (so the caller can shout
+        the dramatic special_dialogue), False otherwise."""
+        if self.special_meter < 100 or self.state not in ("idle", "walk"):
+            return False
+        if self.health <= 0 or self.state == "ko":
+            return False
+
+        # ---- drain the meter completely ----
+        self.special_meter = 0.0
+        # channeling pose: arms thrust forward, melee box must NOT connect
+        self.state = "punch"
+        self.attack_total = CAST_FRAMES
+        self.state_timer = CAST_FRAMES
+        self.punch_cooldown = max(self.punch_cooldown, CAST_FRAMES)
+        self.attack_hit = True
+        self.is_channeling = True
+        self._spawn_astra(opponent, fx)
+        return True
+
+    # ------------------------------------------------------------------
+    # SPECIAL MOVES SYSTEM — per-character astral spawner
+    # ------------------------------------------------------------------
+    def _make_projectile(self, x, y, vx, vy=0.0, damage=None, shape=None,
+                         scale=1.0):
+        """Build one astral projectile record with its own hitbox size."""
+        a = self.astra
+        w, h = a.get("size", (60, 16))
+        return {
+            "x": float(x), "y": float(y),
+            "vx": vx, "vy": vy,
+            "w": int(w * scale), "h": int(h * scale),
+            "damage": self.special_damage if damage is None else damage,
+            "shape": shape or a.get("shape", "arrow"),
+            "scale": scale,
+            "color": self.special_color,
+            "trail": a.get("trail", ""),
+            "owner": self,
+            "hit": False,
+        }
+
+    def _spawn_astra(self, opponent, fx):
+        """Create the visual/hitbox entities for this warrior's special.
+
+        `fx` is the shared ParticleSystem of the fight scene; when it is
+        None a private throw-away system is used so the call never breaks.
+        Every branch spawns 30-50 particles in special_color and requests
+        a screen shake whose intensity scales with the astral's damage."""
+        if fx is None:
+            fx = ParticleSystem()
+        a = self.astra
+        kind = a["kind"]
+        col = self.special_color
+        foot_y = GROUND_Y - self.y
+        hand_x = self.x + self.facing * 48
+        hand_y = foot_y - 112
+        dmg = a.get("damage", self.special_damage)
+        shake = int(a.get("shake", 10))
+        power = a.get("shake_power", 6)
+
+        # ================= PROJECTILE / BARRAGE ASTRAS (archers) ========
+        if kind in ("projectile", "barrage"):
+            speed = a.get("speed", 13)
+            if kind == "barrage":
+                n = a.get("count", 3)
+                spread = a.get("spread", 48)
+                for i in range(n):
+                    dy = (i - (n - 1) / 2.0) * spread
+                    pr = self._make_projectile(hand_x, hand_y + dy * 0.4,
+                                               self.facing * speed,
+                                               damage=dmg, scale=0.6)
+                    pr["vy"] = dy * 0.012      # gentle vertical fan-out
+                    self.projectiles.append(pr)
+            else:
+                self.projectiles.append(
+                    self._make_projectile(hand_x, hand_y,
+                                          self.facing * speed, damage=dmg))
+            fx.spawn(hand_x, hand_y, col, count=random.randint(30, 50),
+                     speed=7, life=26, size=5)
+            fx.shake(shake, power)
+            return
+
+        # ================= SHOCKWAVE (BHIMA · MAHAGADA PRHAR) ===========
+        if kind == "shockwave":
+            speed = a.get("speed", 10)
+            w, h = a.get("size", (70, 92))
             self.projectiles.append({
-                "x": self.x + self.facing * 45,
-                "y": foot_y - 110,
-                "vx": self.facing * 13,
-                "owner": self,
-                "hit": False,
+                "x": self.x + self.facing * 60,
+                "y": GROUND_Y - h / 2.0,       # travels ALONG the ground
+                "vx": self.facing * speed, "vy": 0.0,
+                "w": w, "h": h,
+                "damage": dmg, "shape": "wall", "scale": 1.0,
+                "color": col, "trail": "dust",
+                "life": a.get("life", 90),
+                "owner": self, "hit": False,
             })
-            return True
-        return False
+            # the ground slam itself: dust burst at the caster's feet
+            fx.spawn(self.x + self.facing * 40, GROUND_Y - 8, col,
+                     count=random.randint(40, 50), speed=9, life=34,
+                     size=6, gravity=0.25)
+            fx.shake(shake, power)             # massive earth-shaking
+            return
+
+        # ================= VORTEX (ABHIMANYU · CHAKRAVYUHA BREAKER) =====
+        if kind == "vortex":
+            self.vortex = {
+                "x": self.x, "y": foot_y - 80,
+                "radius": a.get("radius", 120),
+                "damage": dmg, "life": a.get("life", VORTEX_LIFE),
+                "max_life": a.get("life", VORTEX_LIFE),
+                "hit": False,                   # connects ONCE
+                "angle": 0.0,
+            }
+            fx.spawn(self.x, foot_y - 80, col,
+                     count=random.randint(40, 50), speed=8, life=30, size=5)
+            fx.shake(shake, power)
+            return
+
+        # ================= BEAM (ASHWATTHAMA · BRAHMASHIRA) =============
+        if kind == "beam":
+            self.beam_fx = {"life": a.get("life", BEAM_LIFE),
+                            "max": a.get("life", BEAM_LIFE),
+                            "y": foot_y - 100}
+            # instant full-screen-width strike (meter/combo credited by
+            # the fight scene via _finish_special_credit)
+            if opponent is not None and opponent.state != "ko":
+                applied = opponent.take_hit(dmg, self)
+                self._special_credit.append(applied)
+                fx.spawn(opponent.x, GROUND_Y - opponent.y - 100, col,
+                         count=random.randint(45, 50), speed=11, life=36,
+                         size=7)
+                # remember where the impact happened for the spark layer
+                self._pending_fx_sparks.append(
+                    (opponent.x, GROUND_Y - opponent.y - 100, 18, col))
+            # muzzle storm along the beam line
+            for xx in range(0, SCREEN_WIDTH, 90):
+                fx.spawn(xx, foot_y - 100, col, count=4, speed=5, life=22,
+                         size=5)
+            fx.spawn(hand_x, hand_y, (255, 255, 255), count=20, speed=9,
+                     life=24, size=6)
+            fx.shake(shake, power)              # 25-frame-class cataclysm
+            return
+
+        # ================= PILLAR (YUDHISHTHIRA · DHARMA ASTRA) =========
+        if kind == "pillar":
+            tx = opponent.x if opponent is not None else self.x + \
+                self.facing * 200
+            ty = GROUND_Y - (opponent.y if opponent else 0)
+            self.pillar_fx = {"x": tx, "life": a.get("life", PILLAR_LIFE),
+                              "max": a.get("life", PILLAR_LIFE)}
+            if opponent is not None and opponent.state != "ko":
+                applied = opponent.take_hit(dmg, self)
+                # DHARMA'S JUDGEMENT: 30 EXTRA frames of stun on top
+                extra = a.get("extra_stun", EXTRA_STUN_FRAMES)
+                if opponent.state == "hurt":
+                    opponent.state_timer += extra
+                    opponent.extra_stun = extra
+                self.add_meter(applied)
+            fx.spawn(tx, ty - 60, GOLD, count=random.randint(35, 50),
+                     speed=6, life=40, size=6, gravity=-0.12)
+            fx.spawn(tx, ty - 20, col, count=20, speed=9, life=26, size=5)
+            fx.shake(shake, power)
+            return
+
+        # ================= TELEPORT (DURYODHANA · MAYAVI GADA) ==========
+        if kind == "teleport":
+            if opponent is not None and opponent.state != "ko":
+                behind = opponent.x - opponent.facing * 70
+                behind = max(BODY_LEFT_MARGIN,
+                             min(SCREEN_WIDTH - BODY_LEFT_MARGIN, behind))
+                self.teleport_fx = {"from_x": self.x, "at_x": behind,
+                                    "life": a.get("life", TELEPORT_FLASH),
+                                    "max": a.get("life", TELEPORT_FLASH)}
+                self.x = behind
+                self.facing = 1 if opponent.x > self.x else -1
+                applied = opponent.take_hit(dmg, self)
+                self.add_meter(applied)
+                fx.spawn(opponent.x, GROUND_Y - opponent.y - 100, col,
+                         count=random.randint(35, 50), speed=9, life=30,
+                         size=6)
+                fx.add_spark(opponent.x, GROUND_Y - opponent.y - 100,
+                             col, 16)
+            else:
+                self.teleport_fx = {"from_x": self.x, "at_x": self.x,
+                                    "life": TELEPORT_FLASH,
+                                    "max": TELEPORT_FLASH}
+            fx.shake(shake, power)              # purple illusion flash
+            return
+
+        # ================= ILLUSION (SHAKUNI · MAYA JAAL) ===============
+        if kind == "illusion":
+            dur_ms = a.get("life", int(MAYA_JAAL_SECONDS * FPS)) / FPS * 1000
+            self.illusion_fx = {"life": a.get("life", 180),
+                                "max": a.get("life", 180),
+                                "offsets": [(-120, 0), (120, 0), (0, -40)]}
+            if opponent is not None and opponent.state != "ko":
+                applied = opponent.take_hit(dmg, self)
+                self.add_meter(applied)
+                # confuse the foe: their controls flip for 3 seconds
+                opponent.controls_reversed_until = \
+                    pygame.time.get_ticks() + dur_ms
+            for ox, oy in self.illusion_fx["offsets"]:
+                fx.spawn(self.x + ox, GROUND_Y - self.y - 90 + oy, col,
+                         count=random.randint(12, 16), speed=5, life=30,
+                         size=5)
+            fx.shake(shake, power)
+            return
+
+        # ---------- fallback: generic projectile ----------
+        self.projectiles.append(
+            self._make_projectile(hand_x, hand_y, self.facing * 13,
+                                  damage=dmg))
+        fx.spawn(hand_x, hand_y, col, count=30, speed=7, life=24, size=5)
+        fx.shake(shake, power)
 
     def current_damage(self):
         """Damage table straight from the CHARACTERS database."""
@@ -502,6 +794,10 @@ class Fighter:
 
         applied = int(dmg)
         self.health = max(0, self.health - applied)
+        # SPECIAL METER also charges while RECEIVING damage (comeback astras)
+        self.special_meter = min(100.0,
+                                 self.special_meter +
+                                 applied * self.meter_gain_taken)
         self.hit_flash = self.HIT_FLASH_FRAMES             # flash white 15f
         self.combo_count = 0                               # your own combo dies
         self.combo_timer = 0
@@ -595,6 +891,9 @@ class Fighter:
             if self.combo_timer == 0:
                 self.combo_count = 0
 
+        # --- SPECIAL MOVES SYSTEM: tick down astral effect lifetimes ---
+        self._update_astra_effects()
+
         # --- advance the animation clock (bobbing / leg cycle) ---
         self.anim_time += 1.0
 
@@ -623,6 +922,46 @@ class Fighter:
         self.special_meter = min(100.0,
                                  self.special_meter + dmg * self.METER_GAIN)
 
+    # ------------------------------------------------------------------
+    # SPECIAL MOVES SYSTEM — per-frame upkeep for lingering astral fx
+    # ------------------------------------------------------------------
+    def _update_astra_effects(self):
+        """Decay the timers of every persistent special effect this
+        fighter owns (vortex ring, beam, pillar, teleport flash and
+        Shakuni's illusion copies).  Pure bookkeeping - no drawing."""
+        if self.extra_stun > 0:
+            self.extra_stun -= 1
+        for key in ("vortex", "beam_fx", "pillar_fx", "teleport_fx",
+                    "illusion_fx"):
+            fx = getattr(self, key)
+            if fx is not None:
+                fx["life"] -= 1
+                if key == "vortex":
+                    fx["angle"] = fx.get("angle", 0.0) + 0.45
+                    fx["x"] = self.x          # vortex follows the spinner
+                    fx["y"] = GROUND_Y - self.y - 80
+                if fx["life"] <= 0:
+                    setattr(self, key, None)
+
+    def vortex_rect(self):
+        """Square hitbox of an active CHAKRAVYUHA BREAKER whirlwind."""
+        v = self.vortex
+        if v is None or v["hit"]:
+            return None
+        r = int(v["radius"])
+        return pygame.Rect(int(v["x"] - r), int(v["y"] - r), r * 2, r * 2)
+
+    def illusion_copies(self):
+        """MAYA JAAL decoy positions (offsets relative to the caster)."""
+        if self.illusion_fx is None:
+            return []
+        phase = self.illusion_fx["max"] - self.illusion_fx["life"]
+        out = []
+        for i, (ox, oy) in enumerate(self.illusion_fx["offsets"]):
+            wob = math.sin(phase * 0.15 + i * 2.0) * 14
+            out.append((self.x + ox + wob, GROUND_Y - self.y - 96 + oy))
+        return out
+
     def update_ai(self, opponent):
         """Very simple aggressive AI so a solo player can fight someone."""
         if self._busy():
@@ -635,7 +974,8 @@ class Fighter:
         dist = abs(self.x - opponent.x)
         roll = random.random()
         if self.special_meter >= 100 and roll < 0.55:
-            self.start_special()                      # unleash the astral!
+            # unleash the astral (fx=None => private particle system)
+            self.start_special(opponent, None)
         elif dist > 110:
             # walk toward opponent at this warrior's own speed
             self.x += self.facing * max(2, self.speed)
@@ -743,6 +1083,19 @@ class Fighter:
         neck_y += bob
         head_y += bob
 
+        # ---- MAYA JAAL: ghostly decoy copies flanking the caster ----
+        for ix, iy in self.illusion_copies():
+            ghost = pygame.Surface((46, STAND_HEIGHT), pygame.SRCALPHA)
+            pygame.draw.circle(ghost, (*self.special_color, 70),
+                               (23, 20), 13)
+            pygame.draw.rect(ghost, (*self.color, 60),
+                             (11, 38, 24, 62), border_radius=8)
+            pygame.draw.line(ghost, (*self.secondary_color, 70),
+                             (23, 100), (13, 146), 5)
+            pygame.draw.line(ghost, (*self.secondary_color, 70),
+                             (23, 100), (33, 146), 5)
+            target.blit(ghost, (int(ix) - 23, int(iy) - STAND_HEIGHT))
+
         # ---- ground shadow (stays put while jumping) ----
         sh_scale = max(0.4, 1.0 - self.y / 260.0)
         sw = int(90 * sh_scale)
@@ -751,8 +1104,11 @@ class Fighter:
                             (0, 0, sw, 16))
         target.blit(sh, (cx - sw // 2, GROUND_Y - 8))
 
-        # ---- glowing astral aura (special_color) ----
+        # ---- glowing astral aura (special_color; blazes when READY) ----
         self._draw_aura(target, cx, foot_y)
+        # MAYA JAAL aftermath: shimmering violet ring while controls flip
+        if pygame.time.get_ticks() < self.controls_reversed_until:
+            _glow(target, cx, foot_y - 80, 62, (190, 90, 255), 70)
 
         # ---- legs (lines) + feet (small rects) ----
         # KICK VISUAL: the front leg extends outward.  Progress runs 0->1
@@ -1229,6 +1585,167 @@ P2_KEYS = {
 }
 
 
+# =====================================================================
+# SECTION 5B: SPECIAL MOVES SYSTEM — ASTRA REGISTRY
+# =====================================================================
+# Every character's signature weapon is a UNIQUE special, driven by the
+# full 100-point special meter.  The registry maps each fighter name to
+# its behaviour; anything missing falls back to a generic projectile so
+# custom characters still work.
+#
+#   kind == "projectile" : flies straight, one hit (arrow / bolt / disc)
+#   kind == "barrage"    : spawns several small projectiles in a spread
+#   kind == "shockwave"  : travels along the ground (mace slam)
+#   kind == "vortex"     : spinning hitbox around the caster (30 frames)
+#   kind == "beam"       : instant energy beam across the whole screen
+#   kind == "pillar"     : pillar of light drops on the opponent + stun
+#   kind == "teleport"   : blink behind the foe and strike
+#   kind == "illusion"   : damage + reverse the opponent's controls 3 s
+# =====================================================================
+
+CAST_FRAMES = 24            # channeling/pose duration for any special
+VORTEX_LIFE = 30            # CHAKRAVYUHA BREAKER spin window (frames)
+MAYA_JAAL_SECONDS = 3.0     # SHAKUNI's control-reversal duration
+EXTRA_STUN_FRAMES = 30      # YUDHISHTHIRA adds this stun on top of hitstun
+BEAM_LIFE = 18              # BRAHMASHIRA beam visible frames
+PILLAR_LIFE = 34            # DHARMA ASTRA light-pillar visible frames
+TELEPORT_FLASH = 16         # MAYAVI GADA purple flash frames
+
+ASTRAS = {
+    # ---------------- PROJECTILE SPECIALS (archers) ----------------
+    "ARJUNA": dict(                       # BRAHMASTRA — divine arrow
+        kind="projectile", damage=25, speed=13, size=(74, 16),
+        shape="arrow", trail="particles", shake=14, shake_power=9,
+        glow_layers=((30, 70), (20, 130), (11, 255)),
+    ),
+    "KARNA": dict(                        # SHAKTI ASTRA — lightning bolt
+        kind="projectile", damage=28, speed=15, size=(56, 56),
+        shape="bolt", trail="crackle", shake=12, shake_power=8,
+        glow_layers=((30, 70), (19, 130), (10, 255)),
+    ),
+    "BHISHMA PITAMAH": dict(              # PRATIGYA ASTRA — 3-arrow spread
+        kind="barrage", damage=10, speed=14, size=(40, 10),
+        shape="arrow", count=3, spread=52, shake=8, shake_power=5,
+        glow_layers=((18, 60), (12, 120), (6, 255)),
+    ),
+    "DRONACHARYA": dict(                  # NARAYANASTRA — spinning disc
+        kind="projectile", damage=24, speed=12, size=(44, 44),
+        shape="disc", trail="spin", shake=10, shake_power=7,
+        glow_layers=((26, 70), (17, 130), (9, 255)),
+    ),
+    # ---------------- MELEE SPECIALS (mace / sword users) ----------------
+    "BHIMA": dict(                        # MAHAGADA PRHAR — ground shockwave
+        kind="shockwave", damage=30, speed=10, size=(70, 92),
+        shape="wall", life=90, shake=26, shake_power=14,
+        glow_layers=((34, 80), (22, 150), (12, 255)),
+    ),
+    "DURYODHANA": dict(                   # MAYAVI GADA — teleport back-strike
+        kind="teleport", damage=28, life=TELEPORT_FLASH,
+        shake=12, shake_power=8,
+    ),
+    "ABHIMANYU": dict(                    # CHAKRAVYUHA BREAKER — vortex
+        kind="vortex", damage=20, radius=120, life=VORTEX_LIFE,
+        shake=10, shake_power=6,
+    ),
+    # ---------------- UNIQUE SPECIALS ----------------
+    "ASHWATTHAMA": dict(                  # BRAHMASHIRA — full-screen beam
+        kind="beam", damage=30, life=BEAM_LIFE, shake=25, shake_power=13,
+    ),
+    "YUDHISHTHIRA": dict(                 # DHARMA ASTRA — pillar of judgement
+        kind="pillar", damage=22, life=PILLAR_LIFE, extra_stun=30,
+        shake=12, shake_power=7,
+    ),
+    "SHAKUNI": dict(                      # MAYA JAAL — illusion trap
+        kind="illusion", damage=10, life=int(MAYA_JAAL_SECONDS * FPS),
+        shake=6, shake_power=4,
+    ),
+}
+
+DEFAULT_ASTRA = dict(kind="projectile", damage=25, speed=13, size=(60, 16),
+                     shape="arrow", shake=10, shake_power=6,
+                     glow_layers=((26, 70), (17, 130), (10, 255)))
+
+
+def get_astra(name):
+    """Fetch this warrior's astral recipe (safe fallback for customs)."""
+    return ASTRAS.get(name, DEFAULT_ASTRA)
+
+
+# ---------------------------------------------------------------------
+# ASTRA VISUAL SHAPES — every projectile is drawn with pure pygame.draw
+# primitives so each divine weapon looks unique on the battlefield.
+# ---------------------------------------------------------------------
+
+def _glow(target, x, y, radius, color, alpha=180):
+    """Soft translucent halo used by all astral effects."""
+    radius = max(2, int(radius))
+    g = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+    pygame.draw.circle(g, (*color, alpha), (radius, radius), radius)
+    target.blit(g, (int(x) - radius, int(y) - radius))
+
+
+def draw_arrow_shape(target, x, y, facing, col, gold=GOLD, scale=1.0):
+    """Divine arrow: shaft + arrowhead + fletching, pointing along facing."""
+    ln = int(46 * scale)
+    tip_x = x + facing * (ln // 2)
+    tail_x = x - facing * (ln // 2)
+    pygame.draw.line(target, gold, (tail_x, y), (tip_x, y),
+                     max(2, int(4 * scale)))
+    head = int(14 * scale)
+    pygame.draw.polygon(target, col, [(tip_x + facing * head, y),
+                                      (tip_x, y - head // 2),
+                                      (tip_x, y + head // 2)])
+    # fletching feathers
+    for off in (-int(6 * scale), int(6 * scale)):
+        pygame.draw.line(target, col, (tail_x, y),
+                         (tail_x - facing * 8, y + off),
+                         max(2, int(3 * scale)))
+    _glow(target, tip_x, y, 10 * scale, col, 120)
+
+
+def draw_bolt_shape(target, x, y, facing, col, t=0.0):
+    """Crackling lightning bolt (zigzag polyline) with electric core."""
+    pts = []
+    segs = 6
+    h = 44
+    for i in range(segs + 1):
+        frac = i / segs
+        jitter = math.sin(t * 0.7 + i * 2.1) * 9
+        pts.append((x + facing * (frac * 40 - 20) + jitter * 0.4,
+                    y - h / 2 + frac * h + jitter))
+    pygame.draw.lines(target, col, False, pts, 5)
+    inner = tuple(min(255, c + 90) for c in col)
+    pygame.draw.lines(target, inner, False, pts, 2)
+    _glow(target, x, y, 26, col, 90)
+
+
+def draw_disc_shape(target, x, y, col, angle):
+    """Spinning celestial disc (NARAYANASTRA): ring + rotating spokes."""
+    r = 20
+    pygame.draw.circle(target, col, (int(x), int(y)), r, 4)
+    pygame.draw.circle(target, tuple(min(255, c + 70) for c in col),
+                       (int(x), int(y)), r - 8)
+    for k in range(4):
+        a = angle + k * math.pi / 2
+        pygame.draw.line(target, GOLD, (x, y),
+                         (x + math.cos(a) * r, y + math.sin(a) * r), 3)
+    _glow(target, x, y, r + 8, col, 80)
+
+
+def draw_projectile(target, pr, t=0.0):
+    """Dispatch the right visual for one astral projectile."""
+    shape = pr.get("shape", "arrow")
+    col = pr.get("color", GOLD)
+    x, y = pr["x"], pr["y"]
+    f = 1 if pr.get("vx", 1) >= 0 else -1
+    if shape == "bolt":
+        draw_bolt_shape(target, x, y, f, col, t)
+    elif shape == "disc":
+        draw_disc_shape(target, x, y, col, t * 0.35)
+    else:
+        draw_arrow_shape(target, x, y, f, col, scale=pr.get("scale", 1.0))
+
+
 
 # =====================================================================
 # SECTION 6: GAME STATES (the state machine scenes)
@@ -1258,6 +1775,88 @@ class GameState:
 
     def handle_event(self, event):
         pass
+
+    # ------------------------------------------------------------------
+    # SPECIAL MOVES SYSTEM — damage credit & effect resolution
+    # ------------------------------------------------------------------
+    def _finish_special_credit(self, attacker, defender):
+        """Charge meter / combo for astras that strike instantly at cast
+        time (BRAHMASHIRA beam, DHARMA ASTRA pillar, MAYAVI GADA teleport,
+        MAYA JAAL illusion).  Projectile-type astras are credited when the
+        projectile itself connects instead."""
+        for applied in attacker._special_credit:
+            attacker.add_meter(applied)
+            attacker.register_hit(blocked=(defender.state == "block"))
+        attacker._special_credit.clear()
+        for x, y, t, c in attacker._pending_fx_sparks:
+            self.hit_sparks.append((x, y, t, c))
+        attacker._pending_fx_sparks.clear()
+
+    def _resolve_vortex(self):
+        """CHAKRAVYUHA BREAKER: the spinning vortex hitbox surrounds the
+        caster for 30 frames and connects ONCE on any foe caught inside."""
+        for f in (self.f1, self.f2):
+            v = f.vortex
+            box = f.vortex_rect()
+            if box is None:
+                continue
+            foe = self.f2 if f is self.f1 else self.f1
+            if foe.state == "ko":
+                continue
+            if box.colliderect(foe.get_rect()):
+                v["hit"] = True
+                was_blocking = foe.state == "block"
+                applied = foe.take_hit(v["damage"], f)
+                f.add_meter(applied)
+                combo = f.register_hit(blocked=was_blocking)
+                if combo >= 2:
+                    self.combo_pops.append((f, f"{combo} HIT COMBO!", 70))
+                self.hit_sparks.append((foe.x, GROUND_Y - foe.y - 100,
+                                        16, f.special_color))
+                self.fx.spawn(foe.x, GROUND_Y - foe.y - 100,
+                              f.special_color, count=30, speed=8, life=26)
+
+    def _update_astra_projectiles(self):
+        """Fly every astral projectile, spawn its signature trail and
+        expire shockwaves.  Collision/damage stays in _resolve_projectiles."""
+        for f in (self.f1, self.f2):
+            col = f.special_color
+            for pr in list(f.projectiles):
+                pr["x"] += pr.get("vx", 0)
+                pr["y"] += pr.get("vy", 0)
+                shape = pr.get("shape", "arrow")
+                trail = pr.get("trail", "")
+                # ---- per-projectile particle trails (blue arrow streak,
+                #      crackling gold lightning, green disc sparks,
+                #      rolling shockwave dust) ----
+                if trail == "particles":
+                    self.fx.spawn(pr["x"], pr["y"], col, count=2,
+                                  speed=1.5, life=14, size=4)
+                elif trail == "crackle":
+                    self.fx.spawn(pr["x"] + random.uniform(-14, 14),
+                                  pr["y"] + random.uniform(-22, 22),
+                                  col, count=2, speed=2.5, life=10, size=3)
+                elif trail == "spin":
+                    a = self.fight_frame * 0.3
+                    self.fx.spawn(pr["x"] + math.cos(a) * 20,
+                                  pr["y"] + math.sin(a) * 20,
+                                  col, count=1, speed=1.2, life=12, size=3)
+                elif trail == "dust":
+                    self.fx.spawn(pr["x"] - pr.get("vx", 0),
+                                  GROUND_Y - 6, col, count=2, speed=3,
+                                  life=16, size=5, gravity=-0.05)
+                    self.fx.particles[-1]["vy"] = -random.uniform(1, 3) \
+                        if self.fx.particles else 0
+                # ---- shockwaves die out after their lifetime ----
+                if shape == "wall":
+                    pr["life"] = pr.get("life", 90) - 1
+                    if pr["life"] <= 0:
+                        f.projectiles.remove(pr)
+                        continue
+                # ---- off-screen cleanup ----
+                if pr["x"] < -90 or pr["x"] > SCREEN_WIDTH + 90 or \
+                        pr["y"] < -90 or pr["y"] > SCREEN_HEIGHT + 90:
+                    f.projectiles.remove(pr)
 
     def update(self, dt):
         pass
@@ -1494,6 +2093,10 @@ class FightState(GameState):
         self.combo_pops = []
         # frame counter that drives every cooldown / active-window check
         self.fight_frame = 0
+        # ---- SPECIAL MOVES SYSTEM scene state ----
+        self.fx = ParticleSystem()       # shared particles for both sides
+        self.shake_frames = 0            # screen-shake budget (frames left)
+        self.shake_intensity = 0         # max pixel amplitude right now
         # dramatic pre-fight exchange (2 intro lines from the database)
         intro = (p1_data["intro_dialogue"][0] + "   ||   " +
                  p2_data["intro_dialogue"][0])
@@ -1504,10 +2107,17 @@ class FightState(GameState):
         self.banner = (text, color, pygame.time.get_ticks() + ms)
 
     def _special_attempt(self, f):
-        """Try to fire the astral weapon; on success shout the dialogue."""
-        if f.start_special():
+        """Try to fire the astral weapon; on success shout the dialogue.
+
+        The opponent and the shared ParticleSystem are handed to the
+        Fighter so beam / pillar / teleport / illusion specials can strike
+        instantly and spawn their 30-50 particle burst + screen shake."""
+        foe = self.f2 if f is self.f1 else self.f1
+        if f.start_special(opponent=foe, fx=self.fx):
             self.set_banner(f.data["special_dialogue"] + "  ·  "
                             + f.special_name, f.special_color, 2600)
+            # credit meter/combo for astras that hit directly (beam etc.)
+            self._finish_special_credit(f, foe)
 
     def handle_event(self, event):
         """KEYDOWN-driven actions: attacks, jump and the special.
@@ -1530,8 +2140,8 @@ class FightState(GameState):
             self.f1.start_attack("punch")
         elif k == pygame.K_x:
             self.f1.start_attack("kick")
-        elif k == pygame.K_LCTRL or k == pygame.K_RCTRL:
-            self._special_attempt(self.f1)      # P1 astral weapon
+        elif k == pygame.K_c or k == pygame.K_LCTRL or k == pygame.K_RCTRL:
+            self._special_attempt(self.f1)      # P1 astral: C (or Ctrl)
         # ---------------- PLAYER 2 : IJKL + B (punch) N (kick) -----------
         elif k == pygame.K_i:
             self.f2.jump()
@@ -1539,8 +2149,8 @@ class FightState(GameState):
             self.f2.start_attack("punch")
         elif k == pygame.K_n:
             self.f2.start_attack("kick")
-        elif k == pygame.K_SPACE:
-            self._special_attempt(self.f2)      # P2 astral weapon
+        elif k == pygame.K_m or k == pygame.K_SPACE:
+            self._special_attempt(self.f2)      # P2 astral: M (or Space)
 
     @staticmethod
     def _back_key_action(held_back, down_held):
@@ -1559,11 +2169,16 @@ class FightState(GameState):
         pressed = pygame.key.get_pressed()
         if self.winner:
             return
+        now_ms = pygame.time.get_ticks()
 
         # ---------------- PLAYER 1 (arrows + Z/X) ----------------
         f = self.f1
-        left_held = bool(pressed[pygame.K_LEFT])
-        right_held = bool(pressed[pygame.K_RIGHT])
+        # MAYA JAAL: Shakuni's illusion trap flips this fighter's inputs
+        rev1 = now_ms < f.controls_reversed_until
+        left_held = bool(pressed[pygame.K_RIGHT]) if rev1 \
+            else bool(pressed[pygame.K_LEFT])
+        right_held = bool(pressed[pygame.K_LEFT]) if rev1 \
+            else bool(pressed[pygame.K_RIGHT])
         down_held = bool(pressed[pygame.K_DOWN])
         back_held = (left_held if f.facing > 0 else right_held)
         blocking = down_held and back_held
@@ -1587,8 +2202,11 @@ class FightState(GameState):
 
         # ---------------- PLAYER 2 (IJKL + B/N) ------------------
         f = self.f2
-        left_held = bool(pressed[pygame.K_j])
-        right_held = bool(pressed[pygame.K_l])
+        rev2 = now_ms < f.controls_reversed_until
+        left_held = bool(pressed[pygame.K_l]) if rev2 \
+            else bool(pressed[pygame.K_j])
+        right_held = bool(pressed[pygame.K_j]) if rev2 \
+            else bool(pressed[pygame.K_l])
         down_held = bool(pressed[pygame.K_k])
         back_held = (left_held if f.facing > 0 else right_held)
         blocking = down_held and back_held
@@ -1658,24 +2276,54 @@ class FightState(GameState):
                 self.set_banner(f"{defender.name} BLOCKS!", GREY, 900)
 
     def _resolve_projectiles(self):
-        """Astral weapon blasts (specials) fly across the field until they
-        connect; they use special_damage and charge meter like any hit."""
+        """ASTRAL PROJECTILE COLLISIONS — Brahmastra arrows, Shakti bolts,
+        Pratigya barrages, Narayanastra discs and Mahagada shockwaves all
+        live in fighter.projectiles.  Movement/trails happen in
+        _update_astra_projectiles(); here we only test them against the
+        opponent's body box, apply each astral's OWN damage value
+        (pr["damage"]), spark, burst particles and credit meter/combo."""
         for f in (self.f1, self.f2):
             foe = self.f2 if f is self.f1 else self.f1
             for pr in list(f.projectiles):
-                pr["x"] += pr["vx"]
-                rect = pygame.Rect(int(pr["x"]) - 20, int(pr["y"]) - 20,
-                                   40, 40)
-                if rect.colliderect(foe.get_rect()):
+                w = pr.get("w", 40)
+                h = pr.get("h", 40)
+                rect = pygame.Rect(int(pr["x"] - w / 2),
+                                   int(pr["y"] - h / 2), w, h)
+                if foe.state != "ko" and rect.colliderect(foe.get_rect()):
                     was_blocking = foe.state == "block"
-                    applied = foe.take_hit(f.special_damage, f)
+                    dmg = pr.get("damage", f.special_damage)
+                    applied = foe.take_hit(dmg, f)
                     f.add_meter(applied)
-                    f.register_hit(blocked=was_blocking)
+                    combo = f.register_hit(blocked=was_blocking)
+                    if combo >= 2:
+                        self.combo_pops.append(
+                            (f, f"{combo} HIT COMBO!", 70))
                     self.hit_sparks.append((pr["x"], pr["y"], 16,
                                             f.special_color))
+                    # impact explosion in the astral's colour
+                    self.fx.spawn(pr["x"], pr["y"], f.special_color,
+                                  count=random.randint(30, 40), speed=8,
+                                  life=26, size=5)
+                    # shockwaves crumble on contact instead of sticking
+                    if pr.get("shape") == "wall":
+                        self.shake_frames = max(self.shake_frames, 10)
+                        self.shake_intensity = max(self.shake_intensity, 6)
                     f.projectiles.remove(pr)
-                elif pr["x"] < -40 or pr["x"] > SCREEN_WIDTH + 40:
-                    f.projectiles.remove(pr)
+
+    def _drain_fx_requests(self):
+        """Consume the ParticleSystem's queued shake / spark requests."""
+        for frames, intensity in self.fx.drain_shakes():
+            # strongest request wins the amplitude, durations add up
+            self.shake_intensity = max(self.shake_intensity, intensity)
+            self.shake_frames = max(self.shake_frames, frames)
+        for x, y, t, c in self.fx.drain_sparks():
+            self.hit_sparks.append((x, y, t, c))
+        # direct sparks queued inside Fighter._spawn_astra
+        for f in (self.f1, self.f2):
+            if f._pending_fx_sparks:
+                for x, y, t, c in f._pending_fx_sparks:
+                    self.hit_sparks.append((x, y, t, c))
+                f._pending_fx_sparks.clear()
 
     def update(self, dt):
         now = pygame.time.get_ticks()
@@ -1685,7 +2333,11 @@ class FightState(GameState):
             self.f1.update(self.f2)
             self.f2.update(self.f1)
             self._resolve_hits()
-            self._resolve_projectiles()
+            # ---- SPECIAL MOVES SYSTEM pipeline ----
+            self._update_astra_projectiles()   # fly astras + spawn trails
+            self._resolve_projectiles()        # astra <-> body collisions
+            self._resolve_vortex()             # CHAKRAVYUHA BREAKER ring
+            self._drain_fx_requests()          # shake/sparks queued by fx
             # occasional taunts straight out of the character database
             if now >= self.taunt_at:
                 self.taunt_at = now + random.randint(9000, 14000)
@@ -1700,8 +2352,12 @@ class FightState(GameState):
                 self.end_delay_until = now + 2600
         if self.banner and now > self.banner[2]:
             self.banner = None
+        self.fx.update()               # advance every particle this frame
         self.hit_sparks = [(x, y, t - 1, c) for x, y, t, c in
                            self.hit_sparks if t > 1]
+        # screen shake budget decays; intensity scales with what's left
+        if self.shake_frames > 0:
+            self.shake_frames -= 1
         # combo pop-ups fade out on their own frame budget
         self.combo_pops = [(f, txt, t - 1) for f, txt, t in self.combo_pops
                            if t > 1]
@@ -1709,22 +2365,22 @@ class FightState(GameState):
             self.game.result_winner = self.winner.name
             self.game.change_state(STATE_RESULT)
 
-    def draw(self, target):
-        self.game.background.draw(target)
-        self.f1.draw(target)
-        self.f2.draw(target)
+    def draw(self, world_target):
+        """Render the whole fight onto an off-screen canvas, then blit it
+        to the display with a random offset while shake_frames > 0 —
+        that offset IS the screen shake every special requests."""
+        self.game.background.draw(world_target)
+        self.f1.draw(world_target)
+        self.f2.draw(world_target)
 
-        # astral projectiles (each fighter's special_color, glowing comet)
+        # ---- SPECIAL MOVES SYSTEM visuals (all pure pygame shapes) ----
+        self._draw_astra_projectiles(world_target)   # arrows/bolts/discs/walls
         for f in (self.f1, self.f2):
-            for pr in f.projectiles:
-                px, py = int(pr["x"]), int(pr["y"])
-                col = f.special_color
-                for r, a in ((26, 90), (18, 160), (10, 255)):
-                    glow = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
-                    pygame.draw.circle(glow, (*col, a), (r, r), r)
-                    target.blit(glow, (px - r, py - r))
-                pygame.draw.line(target, col,
-                                 (px - int(pr["vx"]) * 2, py), (px, py), 4)
+            self._draw_vortex(world_target, f)       # cyan whirlwind ring
+            self._draw_beam(world_target, f)         # Brahmashira screen beam
+            self._draw_pillar(world_target, f)       # Dharma pillar of light
+            self._draw_teleport_flash(world_target, f)
+        self.fx.draw(world_target)                   # every live particle
 
         # hit sparks
         for x, y, t, c in self.hit_sparks:
@@ -1732,22 +2388,187 @@ class FightState(GameState):
             spark = pygame.Surface((rad * 2, rad * 2), pygame.SRCALPHA)
             pygame.draw.circle(spark, (*c, 200), (rad, rad), rad)
             pygame.draw.circle(spark, (*GOLD, 255), (rad, rad), rad // 2)
-            target.blit(spark, (x - rad, y - rad))
+            world_target.blit(spark, (x - rad, y - rad))
 
-        self._draw_combo_pops(target)
-        self._draw_hud(target)
-        self._draw_banner(target)
+        self._draw_combo_pops(world_target)
+
+        # ---------- camera: blit world -> screen with shake offset ------
+        ox = oy = 0
+        if self.shake_frames > 0:
+            k = self.shake_frames / 30.0                 # decay factor
+            amp = self.shake_intensity * min(1.0, k)
+            ox = random.uniform(-amp, amp)
+            oy = random.uniform(-amp, amp)
+            if self.shake_frames <= 1:
+                self.shake_intensity = 0
+        screen.fill(BLACK)
+        screen.blit(world_target, (int(ox), int(oy)))
+
+        # ---------- HUD is rock-steady above the shaking world ----------
+        self._draw_hud(world_target)     # (kept for combo pop reference)
+        self._draw_hud(screen)
+        self._draw_banner(screen)
 
         # "FIGHT!" banner for first second
         elapsed = pygame.time.get_ticks() - self.round_start
         if elapsed < 1000:
-            draw_centered_text(target, "FIGHT!",
+            draw_centered_text(screen, "FIGHT!",
                                pygame.font.SysFont("arial", 90, bold=True),
                                GOLD, SCREEN_WIDTH // 2, 250, shadow=True)
         elif self.winner:
-            draw_centered_text(target, f"{self.winner.name} WINS!",
+            draw_centered_text(screen, f"{self.winner.name} WINS!",
                                FONT_LARGE, GOLD, SCREEN_WIDTH // 2, 250,
                                shadow=True)
+
+    # ------------------------------------------------------------------
+    # SPECIAL MOVES SYSTEM — drawing routines (pygame shapes only)
+    # ------------------------------------------------------------------
+    def _draw_astra_projectiles(self, target):
+        """Each astral gets its own silhouette: Brahmastra is a huge
+        blue-gold arrow, Shakti a crackling gold bolt, Pratigya small
+        silver arrows, Narayanastra a spinning green disc and Mahagada
+        a rumpling rectangle shockwave riding along the ground."""
+        t = self.fight_frame
+        for f in (self.f1, self.f2):
+            col = f.special_color
+            for pr in f.projectiles:
+                if pr.get("shape") == "wall":
+                    self._draw_shockwave(target, pr, col, t)
+                else:
+                    _glow(target, pr["x"], pr["y"],
+                          max(18, pr.get("w", 40) // 2 + 8), col, 70)
+                    draw_projectile(target, pr, t)
+
+    @staticmethod
+    def _draw_shockwave(target, pr, col, t):
+        """MAHAGADA PRHAR: jagged energy wall travelling on the ground."""
+        w, h = pr.get("w", 70), pr.get("h", 92)
+        x, y = int(pr["x"]), int(pr["y"])
+        wave = pygame.Surface((w, h), pygame.SRCALPHA)
+        pts = [(0, h)]
+        steps = 7
+        for i in range(steps + 1):
+            px = i * w // steps
+            py = h - int(h * (0.35 + 0.5 * abs(
+                math.sin(i * 1.3 + t * 0.4))))
+            pts.append((px, py))
+        pts.append((w, h))
+        pygame.draw.polygon(wave, (*col, 200), pts)
+        inner = tuple(min(255, c + 80) for c in col)
+        small = pygame.transform.smoothscale(wave, (w // 2, h // 2))
+        target.blit(small, (x - w // 4, GROUND_Y - h // 2))
+        target.blit(wave, (x - w // 2, GROUND_Y - h))
+        pygame.draw.line(target, inner, (x - w // 2, GROUND_Y - 3),
+                         (x + w // 2, GROUND_Y - 3), 3)
+
+    def _draw_vortex(self, target, f):
+        """CHAKRAVYUHA BREAKER: concentric spinning arcs + orbiting cyan
+        whirlwind particles centred on Abhimanyu."""
+        v = f.vortex
+        if v is None:
+            return
+        frac = v["life"] / max(1, v["max_life"])
+        cx, cy = v["x"], v["y"]
+        base_r = v["radius"] * (1.15 - 0.35 * frac)
+        col = f.special_color
+        for ring in range(3):
+            r = int(base_r * (0.45 + 0.28 * ring))
+            rect = pygame.Rect(int(cx - r), int(cy - r), r * 2, r * 2)
+            start = v["angle"] + ring * 1.1
+            pygame.draw.arc(target, (*col, int(220 * frac)), rect,
+                            start, start + 2.1, 5)
+            pygame.draw.arc(target, (*WHITE, int(140 * frac)), rect,
+                            start + math.pi, start + math.pi + 2.1, 3)
+        for k in range(8):
+            a = v["angle"] * 1.6 + k * math.tau / 8
+            px = cx + math.cos(a) * base_r
+            py = cy + math.sin(a) * base_r * 0.75
+            _glow(target, px, py, 7, col, int(200 * frac))
+
+    def _draw_beam(self, target, f):
+        """BRAHMASHIRA: red-black annihilation beam across the FULL width
+        of the battlefield, fading over its lifetime."""
+        b = f.beam_fx
+        if b is None:
+            return
+        frac = b["life"] / max(1, b["max"])
+        y = int(b["y"])
+        core_h = max(4, int(30 * frac))
+        col = f.special_color                       # crimson
+        dark = (max(0, col[0] // 3), 0, 0)          # black-red edge
+        pygame.draw.rect(target, (*dark, ), (0, y - core_h,
+                                             SCREEN_WIDTH, core_h * 2))
+        beam = pygame.Surface((SCREEN_WIDTH, core_h * 2), pygame.SRCALPHA)
+        pygame.draw.rect(beam, (*col, int(230 * frac)),
+                         beam.get_rect())
+        inner = tuple(min(255, c + 100) for c in col)
+        pygame.draw.rect(beam, (*inner, int(255 * frac)),
+                         (0, core_h // 2, SCREEN_WIDTH, core_h))
+        target.blit(beam, (0, y - core_h))
+        # crackling edges
+        for xx in range(0, SCREEN_WIDTH, 26):
+            j = math.sin(xx * 0.35 + self.fight_frame * 0.9) * core_h
+            _glow(target, xx, y + j, 6, col, int(180 * frac))
+            _glow(target, xx + 13, y - j, 5, dark, int(160 * frac))
+
+    def _draw_pillar(self, target, f):
+        """DHARMA ASTRA: golden column of judgement falling from the sky
+        onto the sinner's position, widening as it lands."""
+        p = f.pillar_fx
+        if p is None:
+            return
+        frac = p["life"] / max(1, p["max"])
+        x = int(p["x"])
+        top_y = 0
+        bot_y = GROUND_Y
+        grow = 1.0 - frac                           # 0 -> 1 as it falls
+        reach = int(bot_y * min(1.0, grow * 2.2))
+        half_w = int(14 + 26 * min(1.0, grow * 1.6))
+        gold = GOLD
+        shaft = pygame.Surface((half_w * 2, max(2, reach)), pygame.SRCALPHA)
+        pygame.draw.rect(shaft, (*gold, int(170 * frac)), shaft.get_rect())
+        bright = pygame.Surface((half_w, max(2, reach)), pygame.SRCALPHA)
+        pygame.draw.rect(bright, (255, 255, 230, int(230 * frac)),
+                         bright.get_rect())
+        target.blit(shaft, (x - half_w, top_y))
+        target.blit(bright, (x - half_w // 2, top_y))
+        # impact halo at the ground
+        _glow(target, x, GROUND_Y - 8, int(30 + 40 * grow), gold,
+              int(160 * frac))
+        # rising embers
+        for k in range(5):
+            ex = x + math.sin(self.fight_frame * 0.3 + k * 1.7) * half_w
+            ey = GROUND_Y - ((self.fight_frame * 4 + k * 30) %
+                             max(40, reach))
+            _glow(target, ex, ey, 5, gold, 150)
+
+    def _draw_teleport_flash(self, target, f):
+        """MAYAVI GADA: after-image where Duryodhana vanished, purple
+        burst where he appeared and a full-screen maya flash."""
+        tp = f.teleport_fx
+        if tp is None:
+            return
+        frac = tp["life"] / max(1, tp["max"])
+        col = f.special_color
+        # ghost at the origin
+        ghost = pygame.Surface((44, STAND_HEIGHT), pygame.SRCALPHA)
+        pygame.draw.circle(ghost, (*col, int(120 * frac)), (22, 20), 14)
+        pygame.draw.rect(ghost, (*col, int(90 * frac)),
+                         (8, 38, 28, 70), border_radius=8)
+        target.blit(ghost, (int(tp["from_x"]) - 22,
+                            GROUND_Y - STAND_HEIGHT))
+        # burst at the destination (behind the foe)
+        r = int(60 * (1.0 - frac) + 12)
+        _glow(target, tp["at_x"], GROUND_Y - 95, r, col, int(200 * frac))
+        for k in range(6):
+            a = k * math.tau / 6 + self.fight_frame * 0.2
+            _glow(target, tp["at_x"] + math.cos(a) * r,
+                  GROUND_Y - 95 + math.sin(a) * r, 8, col,
+                  int(180 * frac))
+        # violet screen tint pulse
+        veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        veil.fill((*col, int(46 * frac)))
+        target.blit(veil, (0, 0))
 
     def _draw_combo_pops(self, target):
         """COMBO SYSTEM display — 'X HIT COMBO!' in gold above the fighter
