@@ -74,6 +74,9 @@ STATE_MENU = "MENU"
 STATE_CHARACTER_SELECT = "CHARACTER_SELECT"
 STATE_FIGHT = "FIGHT"
 STATE_RESULT = "RESULT"
+# ---- STORY MODE scenes (the Mahabharat narrative campaign) ----
+STATE_STORY = "STORY"            # chapter / narrative text screen
+STATE_STORY_ENDING = "STORY_ENDING"   # "DHARMA KI VIJAY!" + credits
 
 # --- Fonts (created once, reused everywhere) --------------------------
 FONT_SMALL  = pygame.font.SysFont("arial", 22)
@@ -2625,6 +2628,176 @@ def draw_spotlight(target, cx, foot_y, radius, tint=(255, 220, 150)):
 
 
 # =====================================================================
+# SECTION 5D: STORY MODE — THE MAHABHARAT CAMPAIGN (8 chapters)
+# =====================================================================
+# The player always fights on the side of the PANDAVAS.  Each chapter
+# pins down a fixed hero, a fixed opponent, a fixed arena and the AI
+# difficulty that opponent runs at.  Stage names map onto the four
+# procedurally-drawn battle stages; unknown names fall back to the
+# Kurukshetra plains.
+# ---------------------------------------------------------------------
+GAME_VS = "VS"          # arcade versus (1P vs CPU or 2P local)
+GAME_STORY = "STORY"    # the narrative campaign below
+
+STAGE_BY_NAME = {                       # display name -> stage key
+    "kurukshetra": "kurukshetra",
+    "training ground": "kurukshetra",
+    "lake dwaipayana": "dwaipayana",
+    "night camp": "dyut_sabha",
+    "hastinapur": "hastinapur",
+    "dyut sabha": "dyut_sabha",
+    "chakravyuha": "chakravyuha",
+}
+
+
+def resolve_stage(name):
+    """Best-effort mapping from a story chapter's arena text to one of
+    the four battle stages ('kurukshetra', 'hastinapur', 'dyut_sabha',
+    'chakravyuha')."""
+    n = (name or "").lower()
+    for key, val in STAGE_BY_NAME.items():
+        if key in n:
+            return val
+    return "kurukshetra"
+
+
+STORY_CHAPTERS = [
+    dict(
+        num=1,
+        title="The Rivalry Begins",
+        subtitle="Chapter I — Hastinapur's Training Ground",
+        pre_text=["The princes of Hastinapur clash in the arena...",
+                  "Gurus watch from the shade. Duryodhana's eyes burn "
+                  "with envy at Arjuna's flawless aim."],
+        player="ARJUNA", opponent="DURYODHANA",
+        stage_name="Training Ground, Hastinapur", stage="kurukshetra",
+        ai="MEDIUM",
+        after_text=["The Pandava prince proves his skill — but rivalry, "
+                    "once watered, grows like a weed through the realm."],
+    ),
+    dict(
+        num=2,
+        title="The Dice of Doom",
+        subtitle="Chapter II — Dyut Sabha, the Gambling Hall",
+        pre_text=["The cursed dice game seals the fate of the Pandavas...",
+                  "Yudhishthira stakes his kingdom, his brothers, "
+                  "himself — and Shakuni's loaded dice laugh."],
+        player="YUDHISHTHIRA", opponent="SHAKUNI",
+        stage_name="Dyut Sabha", stage="dyut_sabha",
+        ai="MEDIUM",
+        after_text=["Thirteen years of exile are written in those dice. "
+                    "Dharma bleeds, but it does not break."],
+    ),
+    dict(
+        num=3,
+        title="Guru's Test",
+        subtitle="Chapter III — Kurukshetra, the Testing Field",
+        pre_text=["The young warrior faces the master of warfare...",
+                  "Dronacharya asks for his thumb as fee — Abhimanyu "
+                  "cuts through every test with arrows of light."],
+        player="ABHIMANYU", opponent="DRONACHARYA",
+        stage_name="Kurukshetra Battlefield", stage="kurukshetra",
+        ai="HARD",
+        after_text=["The Guru smiles: no student has ever pierced "
+                    "his guard so boldly."],
+    ),
+    dict(
+        num=4,
+        title="The Unbreakable Oath",
+        subtitle="Chapter IV — Kurukshetra, Day 10",
+        pre_text=["The grandsire stands invincible. Only Arjuna can "
+                  "face him...",
+                  "Bhishma lies on a bed of arrows, yet his bow still "
+                  "darkens the sky. His oath: fall only by his own will."],
+        player="ARJUNA", opponent="BHISHMA PITAMAH",
+        stage_name="Kurukshetra, Day 10", stage="kurukshetra",
+        ai="HARD",
+        after_text=["Arrows rise like a canopy and hold the grandsire "
+                    "aloft. Iccha-mrityu — he chooses his moment."],
+    ),
+    dict(
+        num=5,
+        title="Karna's Destiny",
+        subtitle="Chapter V — Kurukshetra, Day 17",
+        pre_text=["Two greatest warriors. One battlefield. "
+                  "Destiny awaits...",
+                  "The sun-born king and the peerless archer — brothers "
+                  "unknowing — finally stand face to face."],
+        player="ARJUNA", opponent="KARNA",
+        stage_name="Kurukshetra, Day 17", stage="kurukshetra",
+        ai="HARD",
+        after_text=["The Vijaya bow falls silent. Karma collects its "
+                    "debt, and both brothers weep unseen."],
+    ),
+    dict(
+        num=6,
+        title="The Mace Duel",
+        subtitle="Chapter VI — Lake Dwaipayana",
+        pre_text=["The final reckoning. Bhima's oath will be fulfilled...",
+                  "Two gadas, two bodies tempered by war — the wind son "
+                  "against the crown prince of Hastinapur."],
+        player="BHIMA", opponent="DURYODHANA",
+        stage_name="Lake Dwaipayana", stage="hastinapur",
+        ai="HARD",
+        after_text=["The gada crashes home. An empire's pride sinks "
+                    "into the red water of the lake."],
+    ),
+    dict(
+        num=7,
+        title="Night of Vengeance",
+        subtitle="Chapter VII — The Pandava Camp, After Midnight",
+        pre_text=["The son of Drona unleashes hell in the darkness...",
+                  "Ashwatthama, cursed and burning, creeps into the camp "
+                  "with the Brahmashira glowing on his brow."],
+        player="ARJUNA", opponent="ASHWATTHAMA",
+        stage_name="Night Camp", stage="dyut_sabha",
+        ai="HARD",
+        after_text=["The gem is torn from his forehead; the curse "
+                    "follows him into endless ages."],
+    ),
+    dict(
+        num=8,
+        title="Dharma's Victory",
+        subtitle="Final Chapter — Kurukshetra, the Last Hour",
+        pre_text=["The ultimate battle. The fate of dharma hangs "
+                  "in balance...",
+                  "Krishna's chariot wheels touch the earth one last "
+                  "time. Aim true, Parth."],
+        player="ARJUNA", opponent="KARNA",
+        stage_name="Kurukshetra, the Last Hour", stage="chakravyuha",
+        ai="HARD",
+        powered=True,               # "powered-up" Karna: +stats
+        after_text=["The dust settles over Kurukshetra. Dharma stands, "
+                    "scarred but unbroken."],
+    ),
+]
+
+STORY_CREDITS = [
+    ("A PRODUCTION", "MAHABHARAT: DIVINE WARFARE"),
+    ("WRITING & CODE", "One artist, one pygame, zero image assets"),
+    ("LORE SOURCES", "Vyasa's Mahabharata · Ganguli · Neelakantha"),
+    ("CAST", "Arjuna · Karna · Bhima · Yudhishthira · Shakuni"),
+    ("", "Duryodhana · Bhishma · Drona · Abhimanyu · Ashwatthama"),
+    ("MUSIC IN YOUR HEAD", "Conch shells, war-drums and Krishna's flute"),
+    ("SPECIAL THANKS", "Every reader who ever wondered who would win"),
+]
+
+
+def powered_up(char_data):
+    """Return a copy of a character record buffed for the FINAL chapter
+    (used for the powered-up Karna)."""
+    d = dict(char_data)
+    d["health"] = int(d.get("health", 100) * 1.35)
+    d["speed"] = min(9, int(d.get("speed", 5)) + 2)
+    d["punch_damage"] = int(d.get("punch_damage", 8) * 1.3)
+    d["kick_damage"] = int(d.get("kick_damage", 12) * 1.3)
+    d["special_damage"] = int(d.get("special_damage", 25) * 1.25)
+    d["name"] = d.get("name", "WARRIOR") + " (DIVINE FORM)"
+    d["epithet"] = "Empowered by the Sun's Last Wrath"
+    return d
+
+
+# =====================================================================
 # SECTION 6: GAME STATES (the state machine scenes)
 # =====================================================================
 
@@ -2728,17 +2901,61 @@ class GameState:
 
 
 class MenuState(GameState):
-    """Title screen: gold title, subtitle, blinking prompt."""
+    """Title screen: gold title, subtitle and a three-option MODE MENU.
+
+        MAHABHARAT : DIVINE WARFARE
+              The Kurukshetra Showdown
+
+        ► 1 PLAYER   — one warrior vs the CPU
+          2 PLAYERS  — local versus on one keyboard
+          STORY MODE — the Mahabharat campaign, 8 chapters
+
+    Up/Down (or W/S) move the cursor, ENTER / SPACE launches the chosen
+    mode, ESC quits.  The prompt line blinks exactly like the original.
+    """
     name = STATE_MENU
+
+    MODES = ("1P", "2P", "STORY")
 
     def __init__(self, game):
         super().__init__(game)
         self.enter_time = pygame.time.get_ticks()
+        self.mode_idx = 0                    # highlighted option
+
+    # ------------------------------------------------------------------
+    # launching the three modes
+    # ------------------------------------------------------------------
+    def _launch(self, idx=None):
+        mode = self.MODES[idx if idx is not None else self.mode_idx]
+        if mode == "1P":
+            self.game.game_mode = GAME_VS
+            self.game.change_state(STATE_CHARACTER_SELECT)
+        elif mode == "2P":
+            self.game.game_mode = GAME_VS
+            self.game.two_player = True
+            self.game.change_state(STATE_CHARACTER_SELECT)
+        else:                                # STORY MODE
+            self.game.game_mode = GAME_STORY
+            self.game.story_index = 0
+            self.game.story_progress = 0
+            self.game.change_state(STATE_STORY)
 
     def handle_event(self, event):
-        if event.type == pygame.KEYDOWN and \
-                event.key in (pygame.K_RETURN, pygame.K_SPACE):
-            self.game.change_state(STATE_CHARACTER_SELECT)
+        if event.type != pygame.KEYDOWN:
+            return
+        k = event.key
+        if k in (pygame.K_UP, pygame.K_w):
+            self.mode_idx = (self.mode_idx - 1) % len(self.MODES)
+        elif k in (pygame.K_DOWN, pygame.K_s):
+            self.mode_idx = (self.mode_idx + 1) % len(self.MODES)
+        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+            self._launch()
+        elif k == pygame.K_1:
+            self._launch(0)
+        elif k == pygame.K_2:
+            self._launch(1)
+        elif k == pygame.K_3:
+            self._launch(2)
 
     def draw(self, target):
         self.game.background.draw(target, dim=60)
@@ -2746,38 +2963,59 @@ class MenuState(GameState):
 
         # gentle pulse on the title
         pulse = 1.0 + 0.03 * math.sin((now - self.enter_time) * 0.002)
-        title_font = pygame.font.SysFont("arial", int(72 * pulse),
-                                         bold=True)
+        title_font = pygame.font.SysFont("arial", int(72 * pulse), bold=True)
         draw_centered_text(target, "MAHABHARAT", title_font, GOLD,
-                           SCREEN_WIDTH // 2, 150, shadow=True)
+                           SCREEN_WIDTH // 2, 96, shadow=True)
         draw_centered_text(target, "DIVINE WARFARE",
-                           pygame.font.SysFont("arial", 46, bold=True),
-                           SAFFRON, SCREEN_WIDTH // 2, 225, shadow=True)
+                           pygame.font.SysFont("arial", 44, bold=True),
+                           SAFFRON, SCREEN_WIDTH // 2, 165, shadow=True)
 
         # decorative divider
-        pygame.draw.line(target, GOLD, (SCREEN_WIDTH // 2 - 220, 275),
-                         (SCREEN_WIDTH // 2 + 220, 275), 3)
-        pygame.draw.circle(target, GOLD, (SCREEN_WIDTH // 2, 275), 6)
+        pygame.draw.line(target, GOLD, (SCREEN_WIDTH // 2 - 220, 208),
+                         (SCREEN_WIDTH // 2 + 220, 208), 3)
+        pygame.draw.circle(target, GOLD, (SCREEN_WIDTH // 2, 208), 6)
 
         draw_centered_text(target, "The Kurukshetra Showdown",
-                           FONT_MEDIUM, WHITE, SCREEN_WIDTH // 2, 315,
+                           FONT_MEDIUM, WHITE, SCREEN_WIDTH // 2, 240,
                            shadow=True)
+
+        # ---------------- the three mode options ----------------
+        labels = {
+            "1P": "1 PLAYER  —  face the Kaurava CPU",
+            "2P": "2 PLAYERS  —  local versus duel",
+            "STORY": "STORY MODE  —  the Mahabharat, 8 chapters",
+        }
+        y = 296
+        for i, key in enumerate(self.MODES):
+            sel = (i == self.mode_idx)
+            col = GOLD if sel else SAFFRON
+            txt = ("►  " + labels[key]) if sel else ("     " + labels[key])
+            font = FONT_MEDIUM if sel else FONT_SMALL
+            r = draw_centered_text(target, txt, font, col,
+                                   SCREEN_WIDTH // 2, y, shadow=sel)
+            if sel:                      # underline sweep on the cursor row
+                pygame.draw.line(target, SAFFRON,
+                                 (r.x - 8, r.bottom + 4),
+                                 (r.right + 8, r.bottom + 4), 2)
+            y += 42
 
         # blinking prompt
         if blink_visible(now - self.enter_time):
             draw_centered_text(target, "Press ENTER to Start",
                                FONT_MEDIUM, SAFFRON, SCREEN_WIDTH // 2,
-                               430, shadow=True)
+                               452, shadow=True)
 
         draw_centered_text(
             target,
             "P1: ARROWS + Z punch / X kick      P2: IJKL + B punch / N kick",
-            FONT_SMALL, SAFFRON, SCREEN_WIDTH // 2, 495)
+            FONT_SMALL, SAFFRON, SCREEN_WIDTH // 2, 498)
         draw_centered_text(target,
-                           "Hold DOWN + BACK to BLOCK  ·  meter full = special",
-                           FONT_SMALL, GREY, SCREEN_WIDTH // 2, 525)
-        draw_centered_text(target, "ESC to Quit", FONT_SMALL, GREY,
-                           SCREEN_WIDTH // 2, 560)
+                           "Hold DOWN + BACK to BLOCK  ·  meter full = "
+                           "special (C / M)",
+                           FONT_SMALL, GREY, SCREEN_WIDTH // 2, 524)
+        draw_centered_text(target, "UP/DOWN choose mode · ENTER start · "
+                                   "ESC quit", FONT_SMALL, GREY,
+                           SCREEN_WIDTH // 2, 556)
 
 
 class CharacterSelectState(GameState):
@@ -3095,7 +3333,7 @@ class FightState(GameState):
     """
     name = STATE_FIGHT
 
-    def __init__(self, game, p1_data, p2_data):
+    def __init__(self, game, p1_data, p2_data, show_intro=True):
         super().__init__(game)
         # Fighters are built straight from the CHARACTERS database records.
         # y = 0 means "standing on the ground line" (GROUND_Y == 430).
@@ -3156,8 +3394,18 @@ class FightState(GameState):
         self.intro_frame = 0                # frames elapsed in the segment
         self.intro_segment = ""             # FADE/P1_SPOT/SWISH/P2_SPOT/VS/BEGIN
         self.intro_zoom = 1.0               # slow zoom factor this segment
+        self.show_intro = bool(show_intro)  # STORY MODE skips the film
+        # ---- BATTLE STAGE hook ----
+        # Story chapters pin an arena ("kurukshetra"/"hastinapur"/
+        # "dyut_sabha"/"chakravyuha"); arcade bouts fall back to the
+        # default sunset plains of Kurukshetra.
+        self.stage_name = getattr(game, "story_stage", None) or "kurukshetra"
         self._intro_build(p1_data, p2_data)
-        self._intro_start("FADE")
+        if self.show_intro:
+            self._intro_start("FADE")
+        else:                               # straight to combat (story mode)
+            self.intro_segment = "DONE"
+            self._intro_start("DONE")
         self.banner = None                  # legacy ribbon not used for intro
 
     # ---------- helpers ----------
@@ -3715,7 +3963,21 @@ class FightState(GameState):
         if self.winner and now >= self.end_delay_until:
             if self.match_over:
                 self.game.result_winner = self.winner.name
-                self.game.change_state(STATE_RESULT)
+                if getattr(self.game, "game_mode", GAME_VS) == GAME_STORY:
+                    # ---- STORY MODE: chapter resolved, no result screen --
+                    ch = STORY_CHAPTERS[min(self.game.story_index,
+                                            len(STORY_CHAPTERS) - 1)]
+                    player_won = (self.winner is self.f1)
+                    self.game.story_last_win = player_won
+                    if player_won:
+                        self.game.story_progress = max(
+                            self.game.story_progress, ch["num"])
+                        self.game.story_index = min(
+                            self.game.story_index + 1,
+                            len(STORY_CHAPTERS) - 1)
+                    self.game.change_state(STATE_STORY)
+                else:
+                    self.game.change_state(STATE_RESULT)
             else:
                 self._begin_next_round()
 
@@ -3781,11 +4043,221 @@ class FightState(GameState):
         self.taunt_at = self.round_start + random.randint(6000, 9000)
         self.set_banner(f"ROUND {self.round_number}", SAFFRON, 1300)
 
+    # ------------------------------------------------------------------
+    # BATTLE STAGES — four arenas drawn entirely with pygame shapes
+    #   kurukshetra : sunset plains (the baked BattlefieldBackground)
+    #   hastinapur  : moonlit palace hall with flickering torches
+    #   dyut_sabha  : the dim gambling hall, dice & oil lamps
+    #   chakravyuha : the vortex formation, stormy sky & rotating rings
+    # The story mode pins one arena per chapter; arcade bouts use the
+    # Kurukshetra plains.  Backdrops are baked once and cached.
+    # ------------------------------------------------------------------
+    STAGE_TITLES = {
+        "kurukshetra": "KURUKSHETRA — THE FIELD OF DHARMA",
+        "hastinapur": "HASTINAPUR — THE PALACE OF KINGS",
+        "dyut_sabha": "DYUT SABHA — THE HALL OF DOOMED DICE",
+        "chakravyuha": "CHAKRAVYUHA — THE ENDLESS VORTEX",
+    }
+
+    def _bake_stage(self, key):
+        """Paint one static backdrop for `key` onto a cached surface."""
+        s = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+        gy = GROUND_Y                       # 430 — fighters stand here
+        if key == "hastinapur":
+            # night sky + moon + stars
+            draw_vertical_gradient(s, (6, 8, 34), (48, 26, 78))
+            for _ in range(90):
+                sx, sy = random.randint(0, SCREEN_WIDTH), \
+                    random.randint(0, int(gy * 0.55))
+                pygame.draw.circle(s, (230, 230, 255), (sx, sy),
+                                   random.choice((1, 1, 2)))
+            pygame.draw.circle(s, (238, 236, 210), (1010, 96), 44)
+            pygame.draw.circle(s, (6, 8, 34), (1028, 84), 40)
+            # marble floor
+            draw_vertical_gradient_region(
+                s, (0, gy, SCREEN_WIDTH, SCREEN_HEIGHT - gy),
+                (150, 140, 150), (58, 50, 66))
+            for i in range(0, SCREEN_WIDTH, 100):
+                pygame.draw.line(s, (96, 88, 104), (i, gy),
+                                 (i - 60, SCREEN_HEIGHT), 2)
+            # pillars + archways
+            for px in (90, 330, 870, 1110):
+                pygame.draw.rect(s, (72, 52, 96),
+                                 (px - 34, 150, 68, gy - 150))
+                pygame.draw.rect(s, (110, 84, 140),
+                                 (px - 42, 138, 84, 22), border_radius=6)
+                pygame.draw.arc(s, (150, 120, 60),
+                                (px - 30, 170, 60, 120), 0, math.pi, 5)
+            for ax in (480, 720):
+                pygame.draw.rect(s, (30, 20, 48), (ax - 70, 210, 140,
+                                                   gy - 210))
+                pygame.draw.arc(s, (150, 120, 60), (ax - 70, 150, 140,
+                                                    140), 0, math.pi, 6)
+            # royal banners
+            for bx, col in ((200, DEEP_RED), (1000, (60, 40, 150))):
+                pygame.draw.rect(s, col, (bx - 26, 160, 52, 170))
+                pygame.draw.polygon(s, col, [(bx - 26, 330), (bx, 356),
+                                             (bx + 26, 330)])
+                pygame.draw.circle(s, GOLD, (bx, 250), 10)
+        elif key == "dyut_sabha":
+            # oppressive dim interior
+            draw_vertical_gradient(s, (14, 8, 12), (52, 26, 16))
+            # ornate pillars
+            for px in (120, 360, 840, 1080):
+                pygame.draw.rect(s, (60, 36, 22), (px - 30, 120, 60,
+                                                   gy - 120))
+                pygame.draw.rect(s, (120, 84, 30), (px - 38, 108, 76, 20))
+                for k in range(3):
+                    pygame.draw.line(s, (90, 60, 24), (px - 26, 180 + k * 70),
+                                     (px + 26, 180 + k * 70), 3)
+            # throne dais
+            pygame.draw.rect(s, (70, 44, 20), (500, 300, 200, gy - 300))
+            pygame.draw.rect(s, (110, 74, 28), (520, 190, 160, 130),
+                             border_radius=10)
+            pygame.draw.circle(s, GOLD, (600, 200), 22)
+            pygame.draw.rect(s, (40, 24, 12), (560, 250, 80, 70))
+            # marble carpet
+            draw_vertical_gradient_region(
+                s, (0, gy, SCREEN_WIDTH, SCREEN_HEIGHT - gy),
+                (74, 40, 30), (28, 14, 10))
+            pygame.draw.rect(s, (120, 84, 30), (0, gy, SCREEN_WIDTH, 6))
+            # scattered gambling dice on the floor
+            for _ in range(9):
+                dx = random.randint(60, SCREEN_WIDTH - 90)
+                dy = random.randint(gy + 30, SCREEN_HEIGHT - 46)
+                dsz = random.randint(16, 26)
+                pygame.draw.rect(s, (235, 228, 210), (dx, dy, dsz, dsz),
+                                 border_radius=4)
+                pygame.draw.rect(s, (120, 100, 80), (dx, dy, dsz, dsz), 1,
+                                 border_radius=4)
+                for _pip in range(random.randint(1, 5)):
+                    pygame.draw.circle(
+                        s, DEEP_RED,
+                        (dx + random.randint(3, dsz - 3),
+                         dy + random.randint(3, dsz - 3)), 2)
+        else:                                # chakravyuha (and fallbacks)
+            draw_vertical_gradient(s, (10, 12, 48), (74, 40, 120))
+            # storm clouds
+            for _ in range(26):
+                cx, cy = random.randint(0, SCREEN_WIDTH), \
+                    random.randint(20, 200)
+                pygame.draw.ellipse(s, (34, 30, 70),
+                                    (cx, cy, random.randint(90, 220),
+                                     random.randint(24, 50)))
+            # floating weapon silhouettes in the sky
+            for _ in range(10):
+                wx, wy = random.randint(40, SCREEN_WIDTH - 60), \
+                    random.randint(60, 250)
+                ang = random.uniform(0, math.tau)
+                ln = random.randint(26, 52)
+                pygame.draw.line(s, (150, 150, 200), (wx, wy),
+                                 (wx + math.cos(ang) * ln,
+                                  wy + math.sin(ang) * ln), 3)
+            # violet ground with concentric rings (aerial feel)
+            draw_vertical_gradient_region(
+                s, (0, gy, SCREEN_WIDTH, SCREEN_HEIGHT - gy),
+                (44, 26, 84), (16, 10, 34))
+            cxs = SCREEN_WIDTH // 2
+            for r in range(40, 620, 56):
+                pygame.draw.ellipse(s, (96, 70, 170),
+                                    (cxs - r, gy + 130 - r // 3,
+                                     r * 2, max(10, r // 2)), 2)
+        return s
+
+    def _get_stage_surface(self, key):
+        cache = self.game.stage_cache
+        if key not in cache:
+            cache[key] = self._bake_stage(key)
+        return cache[key]
+
+    def _draw_battle_stage(self, target):
+        """Blit the current arena, then paint its animated layer."""
+        key = getattr(self, "stage_name", "kurukshetra")
+        if key == "kurukshetra":
+            self.game.background.draw(target)
+            return
+        target.blit(self._get_stage_surface(key), (0, 0))
+        t = self.fight_frame
+        gy = GROUND_Y
+        if key == "hastinapur":
+            # flickering torches on every pillar
+            for px in (90, 330, 870, 1110):
+                for tx in (px - 34, px + 34):
+                    fy = 250 + math.sin(t * 0.3 + tx) * 3
+                    fl = random.randint(9, 15)
+                    pygame.draw.circle(target, (255, 170, 60),
+                                       (tx, int(fy)), fl, )
+                    pygame.draw.circle(target, (255, 230, 120),
+                                       (tx, int(fy)), max(3, fl - 6))
+                    glow = pygame.Surface((90, 90), pygame.SRCALPHA)
+                    pygame.draw.circle(glow, (255, 150, 40, 46),
+                                       (45, 45), 40)
+                    target.blit(glow, (tx - 45, int(fy) - 45))
+        elif key == "dyut_sabha":
+            # swaying oil lamps with warm halos
+            for lx in (240, 600, 960):
+                ly = 170 + math.sin(t * 0.05 + lx) * 4
+                pygame.draw.line(target, (120, 84, 30), (lx, 120),
+                                 (lx, ly), 3)
+                pygame.draw.ellipse(target, (200, 140, 60),
+                                    (lx - 14, ly, 28, 16))
+                pygame.draw.circle(target, (255, 200, 90),
+                                   (lx, int(ly) + 4),
+                                   random.randint(4, 7))
+                halo = pygame.Surface((160, 160), pygame.SRCALPHA)
+                pygame.draw.circle(halo, (255, 170, 60, 34), (80, 80), 70)
+                target.blit(halo, (lx - 80, int(ly) - 60))
+            veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT),
+                                  pygame.SRCALPHA)
+            veil.fill((0, 0, 0, 70))
+            target.blit(veil, (0, 0))
+        elif key == "chakravyuha":
+            # swirling energy rings + random lightning strobes
+            cx = SCREEN_WIDTH // 2
+            for i in range(4):
+                r = 60 + i * 46
+                a0 = t * 0.02 * (1 if i % 2 else -1)
+                pygame.draw.arc(target, (120, 200, 255),
+                                (cx - r, gy + 120 - r // 3, r * 2,
+                                 max(14, r // 2)),
+                                a0, a0 + math.pi * 1.4, 3)
+            if (t % 210) < 6 or random.random() < 0.006:
+                flash = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT),
+                                       pygame.SRCALPHA)
+                flash.fill((220, 230, 255, 90))
+                target.blit(flash, (0, 0))
+                x = random.randint(100, SCREEN_WIDTH - 100)
+                pts = [(x, 0)]
+                for yy in range(40, 300, 40):
+                    pts.append((x + random.randint(-46, 46), yy))
+                pygame.draw.lines(target, WHITE, False, pts, 3)
+
+    def _draw_stage_name(self, target):
+        """Arena title card that fades out at the start of every round."""
+        if not hasattr(self, "round_start"):
+            return
+        elapsed = pygame.time.get_ticks() - self.round_start
+        if elapsed > 2200:
+            return
+        alpha = 255 if elapsed < 1500 else int(255 * (1 - (elapsed - 1500)
+                                                      / 700.0))
+        label = self.STAGE_TITLES.get(getattr(self, "stage_name", ""), "")
+        if not label:
+            return
+        img = FONT_MEDIUM.render(label, True, GOLD)
+        box = pygame.Surface((img.get_width() + 46, img.get_height() + 22),
+                             pygame.SRCALPHA)
+        box.fill((10, 5, 16, max(0, min(200, alpha))))
+        rect = box.get_rect(center=(SCREEN_WIDTH // 2, 400))
+        target.blit(box, rect)
+        img.set_alpha(max(0, min(255, alpha)))
+        target.blit(img, img.get_rect(center=rect.center))
+
     def draw(self, world_target):
         """Render the whole fight onto an off-screen canvas, then blit it
         to the display with a random offset while shake_frames > 0 —
         that offset IS the screen shake every special requests."""
-        self.game.background.draw(world_target)
+        self._draw_battle_stage(world_target)
         self.f1.draw(world_target)
         self.f2.draw(world_target)
 
@@ -3823,6 +4295,7 @@ class FightState(GameState):
         # ---------- HUD is rock-steady above the shaking world ----------
         self._draw_hud(screen)
         self._draw_banner(screen)
+        self._draw_stage_name(screen)   # fading arena title card
 
         # "FIGHT!" announcement for the first 1.4 s of every bout
         elapsed = pygame.time.get_ticks() - self.round_start
@@ -4282,6 +4755,270 @@ class ResultState(GameState):
                                shadow=True)
 
 
+class StoryNarrativeState(GameState):
+    """STORY MODE narrative screen — black background, dramatic text.
+
+    Three flavours, chosen from the game controller's bookkeeping:
+      * INTRO   : chapter title + pre-fight text ("press any key")
+      * OUTRO   : after_text of the chapter just won -> next chapter
+      * DEFEAT  : "The Mahabharat ends differently..." -> retry option
+
+    Pressing any key advances; ENTER on the defeat screen retries the
+    same chapter, ESC returns to the title menu.
+    """
+    name = STATE_STORY
+
+    def __init__(self, game):
+        super().__init__(game)
+        self.enter_time = pygame.time.get_ticks()
+        # decide which flavour this visit is
+        if getattr(game, "story_last_win", None) is False:
+            self.flavour = "DEFEAT"
+        elif game.story_progress > 0 and                 not getattr(game, "_story_intro_shown", True):
+            self.flavour = "INTRO"
+        else:
+            self.flavour = "INTRO"
+        # if a chapter was just won, show its outro instead of an intro
+        if game.story_last_win is True:
+            self.flavour = "OUTRO"
+        idx = min(game.story_index, len(STORY_CHAPTERS) - 1)
+        self.chapter_idx = idx
+        # the outro reads the chapter that was just finished
+        if self.flavour == "OUTRO":
+            self.chapter_idx = max(0, idx - 1) if game.story_progress >=                 STORY_CHAPTERS[idx]["num"] else idx
+            self.chapter_idx = max(0, min(idx, len(STORY_CHAPTERS) - 1))
+            # story_index already advanced -> last played was index-1
+            self.chapter_idx = max(0, idx - 1)
+        self.chapter = STORY_CHAPTERS[self.chapter_idx]
+        self.fade_in_frames = 0
+
+    # ------------------------------------------------------------------
+    # launching the pinned fight for the current chapter
+    # ------------------------------------------------------------------
+    def _begin_chapter_fight(self, ch=None):
+        g = self.game
+        ch = ch or self.chapter
+        p1 = get_character(ch["player"])
+        opp = get_character(ch["opponent"])
+        if ch.get("powered"):
+            opp = powered_up(opp)
+        g.story_stage = resolve_stage(ch.get("stage_name")
+                                      or ch.get("stage", ""))
+        g.story_final = (ch["num"] == len(STORY_CHAPTERS))
+        g.two_player = False          # story mode is always single player
+        g.start_fight(p1, opp, show_intro=False)
+
+    def handle_event(self, event):
+        if event.type != pygame.KEYDOWN:
+            return
+        k = event.key
+        if k == pygame.K_ESCAPE:
+            self.game.game_mode = GAME_VS
+            self.game.change_state(STATE_MENU)
+            return
+        if self.flavour == "DEFEAT":
+            if k in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_y):
+                self.game.story_last_win = None
+                self._begin_chapter_fight()
+            elif k == pygame.K_n:
+                self.game.game_mode = GAME_VS
+                self.game.change_state(STATE_MENU)
+            return
+        if self.flavour == "OUTRO":
+            ch_now = STORY_CHAPTERS[min(self.game.story_index,
+                                        len(STORY_CHAPTERS) - 1)]
+            if self.game.story_progress >= len(STORY_CHAPTERS):
+                self.game.change_state(STATE_STORY_ENDING)
+            else:
+                # outro done -> show the NEXT chapter's intro card
+                self.game.story_last_win = None
+                nxt = STORY_CHAPTERS[min(self.game.story_index,
+                                         len(STORY_CHAPTERS) - 1)]
+                self.chapter = nxt
+                self.chapter_idx = min(self.game.story_index,
+                                       len(STORY_CHAPTERS) - 1)
+                self.flavour = "INTRO"
+                self.enter_time = pygame.time.get_ticks()
+                del ch_now
+            return
+        # INTRO -> straight into the battle
+        self._begin_chapter_fight()
+
+    def update(self, dt):
+        self.fade_in_frames += 1
+
+    def draw(self, target):
+        target.fill(BLACK)
+        now = pygame.time.get_ticks()
+        alpha = min(255, self.fade_in_frames * 8)
+        spin = (now - self.enter_time) * 0.0006
+        # faint dharma chakras watching from the corners
+        draw_dharma_chakra(target, 40, 40, 26, SAFFRON, 16, spin, alpha=90)
+        draw_dharma_chakra(target, SCREEN_WIDTH - 40, 40, 26, SAFFRON,
+                           16, -spin, alpha=90)
+        draw_dharma_chakra(target, 40, SCREEN_HEIGHT - 40, 26, GOLD, 16,
+                           -spin, alpha=70)
+        draw_dharma_chakra(target, SCREEN_WIDTH - 40, SCREEN_HEIGHT - 40,
+                           26, GOLD, 16, spin, alpha=70)
+
+        if self.flavour == "DEFEAT":
+            draw_centered_text(target, "PARAJAY — DEFEAT", FONT_LARGE,
+                               DEEP_RED, SCREEN_WIDTH // 2, 110, shadow=True)
+            lines = ["The Mahabharat ends differently..."]
+            sub = [f"You fell in Chapter {self.chapter['num']}: "
+                   f"“{self.chapter['title']}”.",
+                   "Vyasa's scroll curls at the edges — but fate can be",
+                   "read again. RISE, warrior. The war is not over."]
+            y = 230
+            for ln in lines:
+                draw_centered_text(target, ln, FONT_MEDIUM, WHITE,
+                                   SCREEN_WIDTH // 2, y)
+                y += 44
+            for ln in sub:
+                draw_centered_text(target, ln, FONT_SMALL, GREY,
+                                   SCREEN_WIDTH // 2, y)
+                y += 26
+            if blink_visible(now - self.enter_time):
+                draw_centered_text(target,
+                                   "ENTER: Fight the chapter again    |    "
+                                   "N: Abandon the saga",
+                                   FONT_MEDIUM, SAFFRON,
+                                   SCREEN_WIDTH // 2, 470, shadow=True)
+            return
+
+        ch = self.chapter
+        if self.flavour == "INTRO":
+            draw_centered_text(target, f"CHAPTER {ch['num']} OF "
+                               f"{len(STORY_CHAPTERS)}", FONT_SMALL, GREY,
+                               SCREEN_WIDTH // 2, 70)
+            draw_centered_text(target, ch["title"], FONT_LARGE, GOLD,
+                               SCREEN_WIDTH // 2, 130, shadow=True)
+            draw_centered_text(target, ch["subtitle"], FONT_SMALL, SAFFRON,
+                               SCREEN_WIDTH // 2, 190)
+            y = 250
+            for para in ch["pre_text"]:
+                for ln in wrap_text(para, FONT_MEDIUM,
+                                    SCREEN_WIDTH - 260, max_lines=3):
+                    draw_centered_text(target, ln, WHITE,
+                                       SCREEN_WIDTH // 2, y)
+                    y += 34
+                y += 8
+            # matchup plate
+            p1 = get_character(ch["player"])
+            p2 = get_character(ch["opponent"])
+            plate = pygame.Rect(SCREEN_WIDTH // 2 - 300, y + 20, 600, 74)
+            pygame.draw.rect(target, (20, 10, 28), plate, border_radius=12)
+            pygame.draw.rect(target, (*SAFFRON, ), plate, 2,
+                             border_radius=12)
+            draw_mini_warrior(target, pygame.Rect(plate.x + 12,
+                                                  plate.y + 6, 56, 62),
+                              p1, self.fade_in_frames)
+            draw_mini_warrior(target, pygame.Rect(plate.right - 68,
+                                                  plate.y + 6, 56, 62),
+                              p2, self.fade_in_frames + 30)
+            draw_centered_text(target, f"{p1['name']}   VS   "
+                               f"{p2['name']}", FONT_MEDIUM, GOLD,
+                               plate.centerx, plate.centery - 10)
+            arena = ch.get("stage_name", "Kurukshetra")
+            ai_tag = f"Foe temperament: {ch.get('ai', 'MEDIUM')}"
+            draw_centered_text(target, f"Arena: {arena}   ·   {ai_tag}",
+                               FONT_TINY, GREY, plate.centerx,
+                               plate.centery + 22)
+            if blink_visible(now - self.enter_time):
+                draw_centered_text(target, "Press any key to enter the arena",
+                                   FONT_SMALL, SAFFRON, SCREEN_WIDTH // 2,
+                                   560)
+        else:  # OUTRO
+            draw_centered_text(target, "CHAPTER COMPLETE", FONT_MEDIUM,
+                               GREEN, SCREEN_WIDTH // 2, 80, shadow=True)
+            draw_centered_text(target, ch["title"], FONT_LARGE, GOLD,
+                               SCREEN_WIDTH // 2, 150, shadow=True)
+            y = 250
+            for para in ch.get("after_text", []):
+                for ln in wrap_text(para, FONT_MEDIUM,
+                                    SCREEN_WIDTH - 260, max_lines=3):
+                    draw_centered_text(target, ln, WHITE,
+                                       SCREEN_WIDTH // 2, y)
+                    y += 34
+            prog = self.game.story_progress
+            bar_w = 520
+            bx = SCREEN_WIDTH // 2 - bar_w // 2
+            by = 430
+            pygame.draw.rect(target, (40, 24, 12), (bx, by, bar_w, 18),
+                             border_radius=9)
+            fill = int(bar_w * prog / len(STORY_CHAPTERS))
+            pygame.draw.rect(target, GOLD, (bx, by, max(4, fill), 18),
+                             border_radius=9)
+            pygame.draw.rect(target, SAFFRON, (bx, by, bar_w, 18), 2,
+                             border_radius=9)
+            draw_centered_text(target, f"The Saga: {prog} / "
+                               f"{len(STORY_CHAPTERS)} chapters told",
+                               FONT_SMALL, SAFFRON, SCREEN_WIDTH // 2,
+                               by + 34)
+            if blink_visible(now - self.enter_time):
+                draw_centered_text(target, "Press any key to continue",
+                                   FONT_SMALL, WHITE, SCREEN_WIDTH // 2,
+                                   540)
+        # dim-in veil so the cut between screens feels cinematic
+        if alpha < 255:
+            veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT),
+                                  pygame.SRCALPHA)
+            veil.fill((0, 0, 0, 255 - alpha))
+            target.blit(veil, (0, 0))
+
+
+class StoryEndingState(GameState):
+    """Victory-of-Dharma finale: "DHARMA KI VIJAY!" plus rolling credits."""
+    name = STATE_STORY_ENDING
+
+    def __init__(self, game):
+        super().__init__(game)
+        self.enter_time = pygame.time.get_ticks()
+        self.scroll = 0
+
+    def handle_event(self, event):
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self.game.game_mode = GAME_VS
+                self.game.change_state(STATE_MENU)
+            elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                self.game.game_mode = GAME_VS
+                self.game.change_state(STATE_MENU)
+
+    def update(self, dt):
+        self.scroll += 1
+
+    def draw(self, target):
+        target.fill(BLACK)
+        now = pygame.time.get_ticks()
+        spin = (now - self.enter_time) * 0.0008
+        draw_dharma_chakra(target, SCREEN_WIDTH // 2, 250, 120, GOLD,
+                           24, spin, width=3, alpha=120)
+        pulse = 1.0 + 0.04 * math.sin((now - self.enter_time) * 0.003)
+        big = pygame.font.SysFont("arial", max(40, int(70 * pulse)),
+                                  bold=True)
+        draw_centered_text(target, "धर्म की विजय", FONT_LARGE, SAFFRON,
+                           SCREEN_WIDTH // 2, 110, shadow=True)
+        draw_centered_text(target, "DHARMA KI VIJAY!", big, GOLD,
+                           SCREEN_WIDTH // 2, 190, shadow=True)
+        draw_centered_text(target, "Victory of Righteousness — the saga "
+                           "of Kurukshetra is told", FONT_SMALL, WHITE,
+                           SCREEN_WIDTH // 2, 350)
+        # rolling credits
+        y = 400 - (self.scroll % (len(STORY_CREDITS) * 40 + 200))
+        for label, text in STORY_CREDITS:
+            if -30 < y < SCREEN_HEIGHT:
+                if label:
+                    lb = FONT_TINY.render(label, True, SAFFRON)
+                    target.blit(lb, (SCREEN_WIDTH // 2 - 300, y))
+                tx = FONT_SMALL.render(text, True, GREY)
+                target.blit(tx, (SCREEN_WIDTH // 2 - 120, y - 3))
+            y += 40
+        if blink_visible(now - self.enter_time):
+            draw_centered_text(target, "Press ENTER to return to the title",
+                               FONT_SMALL, SAFFRON, SCREEN_WIDTH // 2, 570)
+
+
 # =====================================================================
 # SECTION 7: GAME CONTROLLER (state machine + main loop)
 # =====================================================================
@@ -4292,6 +5029,15 @@ class Game:
     def __init__(self):
         self.background = BattlefieldBackground()
         self.result_winner = None
+        # ---- STORY MODE bookkeeping ----
+        self.game_mode = GAME_VS          # GAME_VS | GAME_STORY
+        self.two_player = False           # True only for local 2P versus
+        self.story_index = 0              # next chapter to play
+        self.story_progress = 0           # chapters already won
+        self.story_final = False          # True while stage 8 is fought
+        self.story_stage = None           # arena pinned by the chapter
+        self.story_last_win = None        # last chapter outcome (bool)
+        self.stage_cache = {}             # baked battle-stage surfaces
         self.states = {}
         self.state = None
         self.states[STATE_MENU] = MenuState(self)
@@ -4310,10 +5056,20 @@ class Game:
             self.states[STATE_CHARACTER_SELECT] = CharacterSelectState(self)
         elif state_name == STATE_RESULT:
             self.states[STATE_RESULT] = ResultState(self)
+        elif state_name == STATE_STORY:
+            self.states[STATE_STORY] = StoryNarrativeState(self)
+        elif state_name == STATE_STORY_ENDING:
+            self.states[STATE_STORY_ENDING] = StoryEndingState(self)
         self.state = self.states[state_name]
 
-    def start_fight(self, p1_data, p2_data):
-        self.states[STATE_FIGHT] = FightState(self, p1_data, p2_data)
+    def start_fight(self, p1_data, p2_data, show_intro=True):
+        """Create the fight scene and switch to it.
+
+        show_intro=False is used by STORY MODE: the narrative screen has
+        already set the scene, so the bout opens instantly with the
+        classic "FIGHT!" announcement instead of the spotlight film."""
+        self.states[STATE_FIGHT] = FightState(self, p1_data, p2_data,
+                                              show_intro=show_intro)
         self.state = self.states[STATE_FIGHT]
 
     # off-screen canvas used by FightState for the screen-shake camera
