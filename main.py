@@ -1120,6 +1120,7 @@ class Fighter:
         self.projectiles = []           # this fighter's astral blasts
         self.ai_decision_timer = 0
         self.is_channeling = False        # True while casting the astral weapon
+        self.armor_active = False         # POLISH: super armour this frame
 
         # =============== SPECIAL MOVES SYSTEM STATE ===================
         self.astra = get_astra(self.name)   # this warrior's astral recipe
@@ -1150,6 +1151,13 @@ class Fighter:
         #                shots (1.0 == normal size).
         self.intro_lock = False
         self.draw_scale = 1.0
+        # ---- AI OPPONENT SYSTEM -------------------------------------
+        # `brain` is set by the fight scene when this fighter is run by
+        # the CPU.  The brain only *publishes intent* (a set of virtual
+        # key names); FightState injects those keys into the very same
+        # input pipeline a human uses, so the AI walks / jumps / blocks /
+        # crouches exactly like a player would.
+        self.brain = None                 # AIBrain | None (human controlled)
 
     # ------------------------------------------------------------------
     # COMBAT TIMING CONSTANTS (per spec)
@@ -1607,6 +1615,15 @@ class Fighter:
 
         chest_y = GROUND_Y - self.y - 100      # impact point for fx
 
+        # ---- POLISH: SUPER ARMOR -----------------------------------
+        # Bhima / Duryodhana shrug off interruptions while their astra is
+        # being cast; Bhishma's iccha-mrityu makes him unbreakable once he
+        # is down to his last 20% of health.  Damage still lands, but the
+        # hit stun / knockback / flash are skipped entirely.
+        armored = self.has_super_armor()
+        if armored:
+            blocked = False
+
         if blocked:
             applied = max(1, int(round(dmg * (1.0 - self.BLOCK_REDUCTION))))
             self.health = max(0, self.health - applied)
@@ -1649,12 +1666,37 @@ class Fighter:
                                             self.special_color, count=40)
                 self.fx.freeze(6)
         else:
-            self.state = "hurt"                            # hit stun
-            self.state_timer = self.HIT_STUN
-            self.vx = facing_in * 6                        # knockback slide
-            self.vy = 2                                    # slight lift
+            if armored and self.health > 0:
+                # SUPER ARMOR: the blow bites but never breaks the stance —
+                # no hit stun, no knockback, no white flash.  Golden guard
+                # sparks mark the "clink" of an unbreakable warrior.
+                self.vx = 0.0
+                self.vy = 0.0
+                if self.fx is not None:
+                    self.fx.create_hit_sparks(self.x + facing_in * 26,
+                                              chest_y, GOLD, count=10)
+            else:
+                self.state = "hurt"                            # hit stun
+                self.state_timer = self.HIT_STUN
+                self.vx = facing_in * 6                        # knockback slide
+                self.vy = 2                                    # slight lift
         self._clamp_to_stage()
         return applied
+
+    # ------------------------------------------------------------------
+    # POLISH — SUPER ARMOR rules
+    #   * BHIMA & DURYODHANA: immune to interruption while their astra is
+    #     being channelled (the gada never stops swinging).
+    #   * BHISHMA PITAMAH: iccha-mrityu — death comes only when he wills
+    #     it, so in his last 20% of health he cannot be staggered at all.
+    # ------------------------------------------------------------------
+    def has_super_armor(self):
+        if self.is_channeling and self.name in ("BHIMA", "DURYODHANA"):
+            return True
+        if self.name == "BHISHMA PITAMAH" and self.max_health > 0 and \
+                self.health <= self.max_health * 0.2 and self.health > 0:
+            return True
+        return False
 
     @staticmethod
     def _last_attacker_facing(attacker):
@@ -4116,6 +4158,42 @@ class FightState(GameState):
     def _back_key_action(held_back, down_held):
         return "block" if (held_back and down_held) else "crouch"
 
+    # ------------------------------------------------------------------
+    # AI CONTROL LAYER — virtual keyboard for the CPU fighter
+    # ------------------------------------------------------------------
+    # The fight scene drives both fighters through pygame.key.get_pressed.
+    # For the CPU we build a *virtual* key state: every frame the brain
+    # publishes its intent as key names ("left", "punch", ...) and those
+    # names are mapped onto real pygame key constants inside a copy of the
+    # pressed-keys array.  That way the AI uses exactly the same input
+    # pipeline (and therefore the same blocking / crouching rules) as a
+    # human player.
+    AI_KEYMAP = {
+        "left": pygame.K_LEFT, "right": pygame.K_RIGHT,
+        "up": pygame.K_UP, "down": pygame.K_DOWN,
+        "punch": pygame.K_z, "kick": pygame.K_x, "special": pygame.K_c,
+    }
+
+    def _apply_ai_input(self):
+        """Return the held-key array, with P2's slots overwritten by the
+        CPU's virtual presses whenever an AI fighter occupies that slot."""
+        pressed = pygame.key.get_pressed()
+        cpu = None
+        if not self.game.two_player and getattr(self.f2, "brain", None):
+            cpu = self.f2
+        elif getattr(self.f1, "brain", None):
+            cpu = self.f1
+        if cpu is None:
+            return pressed
+        arr = pressed[:]                     # private copy for the CPU slot
+        for code in list(self.AI_KEYMAP.values()):
+            arr[code] = False
+        for act in cpu.brain.held:
+            code = self.AI_KEYMAP.get(act)
+            if code is not None:
+                arr[code] = True
+        return arr
+
     def _process_movement(self):
         """HOLD-based controls, evaluated fresh every frame.
 
@@ -4125,8 +4203,13 @@ class FightState(GameState):
             K + *back* direction      ->  BLOCK (guard)
 
         "Back" simply means the arrow pointing away from the opponent,
-        which is the classic fighting-game guard input."""
-        pressed = pygame.key.get_pressed()
+        which is the classic fighting-game guard input.
+
+        When a fighter is CPU-controlled its brain publishes a set of
+        virtual key presses (_apply_ai_input) so the AI walks, jumps,
+        blocks and crouches through exactly the same code path as a human.
+        """
+        pressed = self._apply_ai_input()
         if self.hud_freeze or self.winner:
             return
         now_ms = pygame.time.get_ticks()
@@ -4393,6 +4476,7 @@ class FightState(GameState):
         astral-effect timer starts clean) using the stored char record,
         spawn x and keymap, then re-seeds the HUD's smooth-drain value."""
         slot = 0 if not f.is_player2 else 1
+        old_brain = getattr(f, "brain", None)   # POLISH: keep the CPU alive
         fresh = Fighter(self.spawn_data[slot]["data"],
                         self.spawn_data[slot]["x"], 0,
                         facing=facing, is_player2=f.is_player2,
@@ -4401,6 +4485,11 @@ class FightState(GameState):
         f.__dict__.clear()
         f.__dict__.update(fresh.__dict__)
         f.display_health = float(f.health)
+        # POLISH: the AI brain survives a round reset — re-attach it and
+        # clear any stale plan so the CPU starts the new round fresh.
+        if old_brain is not None:
+            f.brain = old_brain
+            old_brain.reset()
 
     def _begin_next_round(self):
         """Round interlude ended — restore both warriors and tick the
