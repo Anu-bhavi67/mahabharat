@@ -76,6 +76,7 @@ STATE_RESULT = "RESULT"
 
 # --- Fonts (created once, reused everywhere) --------------------------
 FONT_SMALL  = pygame.font.SysFont("arial", 22)
+FONT_TINY   = pygame.font.SysFont("arial", 15)   # character-card micro text
 FONT_COMBO  = pygame.font.SysFont("arial", 34, bold=True)   # "X HIT COMBO!"
 FONT_MEDIUM = pygame.font.SysFont("arial", 32, bold=True)
 FONT_LARGE  = pygame.font.SysFont("arial", 64, bold=True)
@@ -185,12 +186,52 @@ class BattlefieldBackground:
             if p[0] > SCREEN_WIDTH:
                 p[0] = 0
 
-    def draw(self, target):
-        target.blit(self.surface, (0, 0))
+    def draw(self, target, dim=0):
+        """Blit the baked battlefield; `dim` (0-255) darkens it (menus)."""
+        if dim > 0:
+            veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT),
+                                  pygame.SRCALPHA)
+            veil.fill((8, 4, 14, dim))
+            target.blit(self.surface, (0, 0))
+            target.blit(veil, (0, 0))
+        else:
+            target.blit(self.surface, (0, 0))
         for x, y, _, r in self.dust_particles:
             dust = pygame.Surface((6, 6), pygame.SRCALPHA)
             pygame.draw.circle(dust, (*SAFFRON, 60), (3, 3), int(r) + 1)
             target.blit(dust, (x, y))
+
+
+def draw_dharma_chakra(target, cx, cy, radius, color=(255, 170, 40),
+                       spokes=24, angle_offset=0.0, width=2,
+                       hub=True, alpha=200):
+    """A small dharma chakra: rim circle + radiating spokes (+hub).
+
+    Used as a decorative motif in the corners of the character-select
+    screen and wherever else sacred geometry is wanted.  Pure shapes —
+    no image assets.
+    """
+    surf = pygame.Surface((radius * 2 + 4, radius * 2 + 4), pygame.SRCALPHA)
+    c = (cx - surf.get_width() // 2 + radius + 2,
+         cy - surf.get_height() // 2 + radius + 2)
+    rim = (*color, alpha)
+    pygame.draw.circle(surf, rim, (c[0], c[1]), radius, width)
+    pygame.draw.circle(surf, (*color, max(20, alpha // 3)),
+                       (c[0], c[1]), max(2, radius - 4), 1)
+    for i in range(spokes):
+        a = angle_offset + i * (math.tau / max(1, spokes))
+        x1 = c[0] + math.cos(a) * (radius - 5)
+        y1 = c[1] + math.sin(a) * (radius - 5)
+        x2 = c[0] - math.cos(a) * (radius - 5)
+        y2 = c[1] - math.sin(a) * (radius - 5)
+        pygame.draw.line(surf, rim, (x1, y1), (x2, y2), max(1, width - 1))
+    if hub:
+        pygame.draw.circle(surf, (*color, min(255, alpha + 40)),
+                           (c[0], c[1]), max(3, radius // 5))
+        pygame.draw.circle(surf, (0, 0, 0, min(200, alpha)),
+                           (c[0], c[1]), max(2, radius // 9))
+    target.blit(surf, (cx - surf.get_width() // 2,
+                       cy - surf.get_height() // 2))
 
 
 def draw_vertical_gradient_region(surface, region, top_color, bottom_color):
@@ -1746,6 +1787,97 @@ def draw_projectile(target, pr, t=0.0):
         draw_arrow_shape(target, x, y, f, col, scale=pr.get("scale", 1.0))
 
 
+# ---------------------------------------------------------------------
+# MINI WARRIOR PORTRAIT (character-select cards)
+#   Draws a compact stick-figure fighter — head, torso, limbs, weapon
+#   and a faint special-colour aura — scaled down to fit inside a card.
+#   Same drawing language as the in-game Fighter class so each card is
+#   instantly recognisable as that warrior.
+# ---------------------------------------------------------------------
+def draw_mini_warrior(target, rect, char_data, t=0.0):
+    """Render a small animated warrior preview inside `rect`."""
+    cx = rect.centerx
+    base_y = rect.bottom - 6                       # feet baseline
+    s = max(0.25, min(1.0, rect.height / STAND_HEIGHT))
+    col = char_data.get("color", SAFFRON)
+    sec = char_data.get("secondary_color", WHITE)
+    spc = char_data.get("special_color", GOLD)
+    weapon = str(char_data.get("weapon", ""))
+
+    def P(dx, dy):                                # local -> screen point
+        return (int(cx + dx * s), int(base_y - dy * s))
+
+    bob = math.sin(t * 0.08) * 2                  # gentle idle breathing
+
+    # ---- soft aura halo (special colour) ----
+    halo = pygame.Surface((76, 76), pygame.SRCALPHA)
+    pygame.draw.circle(halo, (*spc, 45), (38, 38), 36)
+    pygame.draw.circle(halo, (*spc, 25), (38, 38), 26)
+    target.blit(halo, (cx - 38, int(base_y - 78 * s) - 38))
+
+    # ---- legs (walking swing driven by sin) ----
+    swing = math.sin(t * 0.18) * 4
+    hip = P(0, 62 + bob)
+    target_line = pygame.draw.line
+    target_line(target, sec, hip, P(-7 - swing, 0), max(2, int(4 * s)))
+    target_line(target, sec, hip, P(7 + swing, 0), max(2, int(4 * s)))
+    pygame.draw.rect(target, col, (*P(-13 - swing, 4), 9, 4))   # feet
+    pygame.draw.rect(target, col, (*P(5 + swing, 4), 9, 4))
+
+    # ---- torso ----
+    torso = pygame.Rect(0, 0, max(8, int(20 * s)), max(16, int(48 * s)))
+    tx, ty = P(0, 62 + bob)
+    torso.centerx, torso.bottom = tx, ty
+    pygame.draw.rect(target, col, torso, border_radius=max(2, int(6 * s)))
+    pygame.draw.line(target, sec, P(-10, 104 + bob), P(10, 104 + bob),
+                     max(2, int(3 * s)))          # shoulder bar
+
+    # ---- arms + fists ----
+    hand_f = P(16, 82 + bob)
+    hand_b = P(-16, 82 + bob)
+    pygame.draw.line(target, sec, P(-9, 100 + bob), hand_b,
+                     max(2, int(3 * s)))
+    pygame.draw.line(target, sec, P(9, 100 + bob), hand_f,
+                     max(2, int(3 * s)))
+    pygame.draw.circle(target, GOLD, hand_f, max(2, int(4 * s)))
+    pygame.draw.circle(target, sec, hand_b, max(2, int(4 * s)))
+
+    # ---- head + crown / helmet crest ----
+    head = P(0, 122 + bob)
+    pygame.draw.circle(target, sec, head, max(4, int(11 * s)))
+    pygame.draw.polygon(target, col, [P(-9, 130 + bob), P(0, 146 + bob),
+                                      P(9, 130 + bob)])
+    pygame.draw.circle(target, spc, P(0, 148 + bob), max(1, int(3 * s)))
+
+    # ---- weapon silhouette from the database field ----
+    if "Bow" in weapon:                            # Gandiva / Vijaya etc.
+        pts = [P(20, 128), P(30, 100), P(20, 72)]
+        pygame.draw.lines(target, GOLD, False, pts, max(2, int(2 * s)))
+        pygame.draw.line(target, WHITE, pts[0], pts[2], 1)
+    if "Gada" in weapon or "Mace" in weapon:       # Bhima / Duryodhana
+        pygame.draw.line(target, (150, 100, 50), P(18, 96), P(26, 130),
+                         max(2, int(3 * s)))
+        pygame.draw.circle(target, col, P(27, 134), max(3, int(7 * s)))
+        pygame.draw.circle(target, GOLD, P(27, 134),
+                           max(3, int(7 * s)), 2)
+    if "Sword" in weapon:                          # Abhimanyu / Ashwatthama
+        pygame.draw.line(target, (220, 220, 230), P(16, 92), P(30, 122),
+                         max(2, int(3 * s)))
+        pygame.draw.line(target, GOLD, P(12, 96), P(20, 88),
+                         max(2, int(2 * s)))
+    if "Dice" in weapon:                           # Shakuni's loaded dice
+        d = max(4, int(7 * s))
+        pygame.draw.rect(target, (230, 230, 220), (P(14, 78)[0],
+                                                    P(14, 78)[1], d, d))
+        pygame.draw.rect(target, DEEP_RED, (P(14, 78)[0], P(14, 78)[1],
+                                            d, d), 1)
+    if "Spear" in weapon:                          # Yudhishthira's dharma spear
+        pygame.draw.line(target, (180, 140, 60), P(18, 60), P(26, 140),
+                         max(2, int(2 * s)))
+        pygame.draw.polygon(target, GOLD, [P(24, 138), P(30, 152),
+                                           P(28, 136)])
+
+
 
 # =====================================================================
 # SECTION 6: GAME STATES (the state machine scenes)
@@ -1879,7 +2011,7 @@ class MenuState(GameState):
             self.game.change_state(STATE_CHARACTER_SELECT)
 
     def draw(self, target):
-        self.game.background.draw(target)
+        self.game.background.draw(target, dim=60)
         now = pygame.time.get_ticks()
 
         # gentle pulse on the title
@@ -1919,149 +2051,305 @@ class MenuState(GameState):
 
 
 class CharacterSelectState(GameState):
-    """Both players pick a warrior from the roster grid (5 x 2 cards)."""
+    """CHOOSE YOUR WARRIOR — 5x2 card grid, dual-cursor selection.
+
+    LAYOUT
+      * Gold title "CHOOSE YOUR WARRIOR" at the top
+      * 10 cards (5 columns x 2 rows); every card shows the character
+        name in their own colour, a mini drawn fighter preview, HP/SPD/PWR
+        stat bars, weapon name and the special-move name in special_color
+      * Dharma-chakra emblems decorate all four screen corners
+      * Bottom panel: description + dialogue quote of the hovered hero
+
+    SELECTION
+      * P1 browses with the ARROW keys, confirms with ENTER
+      * P2 browses with I/J/K/L, confirms with SPACE
+      * The hovered card previews that character's intro dialogue
+      * Glowing borders: red pulse for P1's cursor, blue pulse for P2's;
+        locked cards show "✓ READY" in green
+      * When BOTH are ready -> automatic countdown -> FIGHT! announcement
+        inside the fight scene
+    """
     name = STATE_CHARACTER_SELECT
+
+    # ---- layout geometry -------------------------------------------
+    COLS, ROWS = 5, 2
+    CARD_W, CARD_H = 216, 148
+    GRID_X, GRID_Y = 24, 138
+    GAP_X, GAP_Y = 9, 12
+    PANEL_TOP = 470                     # start of the info panel
 
     def __init__(self, game):
         super().__init__(game)
-        self.p1_idx = 0
-        self.p2_idx = len(ROSTER) - 1
+        self.p1_idx = 0                          # ARJUNA
+        self.p2_idx = len(ROSTER) - 1            # SHAKUNI
         self.p1_ready = False
         self.p2_ready = False
+        self.t = 0                               # animation timer (frames)
+        self.launch_timer = None                 # frames until fight starts
+        self.flash = 0                           # white flash on lock-in
 
-    # -- helpers --
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
     def cell_rect(self, i):
-        """Grid: 5 columns x 2 rows of portrait cards."""
-        col, row = i % 5, i // 5
-        x = 30 + col * 234
-        y = 150 + row * 178
-        return pygame.Rect(x, y, 210, 150)
+        """Screen rect of roster card number i (5 columns x 2 rows)."""
+        col, row = i % self.COLS, i // self.COLS
+        x = self.GRID_X + col * (self.CARD_W + self.GAP_X)
+        y = self.GRID_Y + row * (self.CARD_H + self.GAP_Y)
+        return pygame.Rect(x, y, self.CARD_W, self.CARD_H)
 
+    def _move(self, idx, dx, dy):
+        """Wrap-aware grid navigation for a cursor."""
+        col, row = idx % self.COLS, idx // self.COLS
+        col = (col + dx) % self.COLS
+        row = (row + dy) % self.ROWS
+        return row * self.COLS + col
+
+    # ------------------------------------------------------------------
+    # input
+    # ------------------------------------------------------------------
     def handle_event(self, event):
         if event.type != pygame.KEYDOWN:
             return
         k = event.key
-        # ---- PLAYER 1 : A/D/W/S or the ARROW keys, ENTER to confirm ----
-        if not self.p1_ready:
-            if k in (pygame.K_a, pygame.K_LEFT):
-                self.p1_idx = (self.p1_idx - 1) % len(ROSTER)
-            elif k in (pygame.K_d, pygame.K_RIGHT):
-                self.p1_idx = (self.p1_idx + 1) % len(ROSTER)
-            elif k in (pygame.K_w, pygame.K_UP):
-                self.p1_idx = (self.p1_idx - 5) % len(ROSTER)
-            elif k in (pygame.K_s, pygame.K_DOWN):
-                self.p1_idx = (self.p1_idx + 5) % len(ROSTER)
-            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                self.p1_ready = True
-        # ---- PLAYER 2 : I/J/K/L, B or N to confirm ----
-        if not self.p2_ready:
-            if k == pygame.K_j:
-                self.p2_idx = (self.p2_idx - 1) % len(ROSTER)
-            elif k == pygame.K_l:
-                self.p2_idx = (self.p2_idx + 1) % len(ROSTER)
-            elif k == pygame.K_i:
-                self.p2_idx = (self.p2_idx - 5) % len(ROSTER)
-            elif k == pygame.K_k:
-                self.p2_idx = (self.p2_idx + 5) % len(ROSTER)
-            elif k in (pygame.K_b, pygame.K_n, pygame.K_SPACE):
-                self.p2_ready = True
-        if self.p1_ready and self.p2_ready:
-            if k == pygame.K_RETURN or k == pygame.K_KP_ENTER:
-                self.game.start_fight(ROSTER[self.p1_idx],
-                                      ROSTER[self.p2_idx])
         if k == pygame.K_ESCAPE:
             self.game.change_state(STATE_MENU)
+            return
 
-    def _draw_stats_panel(self, target):
-        """Show hovered character's lore + stat bars at the bottom."""
-        hero = ROSTER[self.p1_idx]
-        py = 512
-        pygame.draw.rect(target, (18, 10, 26, 200),
-                         (20, py - 6, SCREEN_WIDTH - 40, 84),
-                         border_radius=10)
-        # name + weapon + epithet line
-        draw_centered_text(target,
-                           f"{hero['name']}  —  {hero['weapon']}",
-                           FONT_SMALL, SAFFRON, SCREEN_WIDTH // 2, py + 6)
-        desc = hero["description"]
-        if len(desc) > 118:
-            desc = desc[:116].rsplit(" ", 1)[0] + "…"
-        draw_centered_text(target, desc, FONT_SMALL, GREY,
-                           SCREEN_WIDTH // 2, py + 30)
+        # ---------------- PLAYER 1 : ARROW KEYS + ENTER ----------------
+        if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.p1_ready = not self.p1_ready    # ENTER locks / unlocks P1
+            if self.p1_ready:
+                self.flash = 8
+        elif not self.p1_ready:
+            if k == pygame.K_LEFT:
+                self.p1_idx = self._move(self.p1_idx, -1, 0)
+            elif k == pygame.K_RIGHT:
+                self.p1_idx = self._move(self.p1_idx, +1, 0)
+            elif k == pygame.K_UP:
+                self.p1_idx = self._move(self.p1_idx, 0, -1)
+            elif k == pygame.K_DOWN:
+                self.p1_idx = self._move(self.p1_idx, 0, +1)
 
-        # compact stat chips: HP / SPD / PWR(special) / punch / kick
-        chips = [(f"HP {hero['health']}", GREEN),
-                 (f"SPD {hero['speed']}", DARK_BLUE),
-                 (f"PWR {hero['special_damage']}", DEEP_RED),
-                 (f"SPECIAL: {hero['special_name']}", GOLD)]
-        total_w = sum(FONT_SMALL.size(t)[0] + 26 for t, _ in chips)
-        x = (SCREEN_WIDTH - total_w) // 2
-        for text, col in chips:
-            w = FONT_SMALL.size(text)[0] + 22
-            chip = pygame.Rect(x, py + 52, w, 24)
-            pygame.draw.rect(target, (40, 25, 55), chip, border_radius=8)
-            pygame.draw.rect(target, col, chip, 2, border_radius=8)
-            img = FONT_SMALL.render(text, True, col if col != GOLD else GOLD)
-            target.blit(img, (chip.x + 11, chip.y + 3))
-            x += w + 4
+        # ---------------- PLAYER 2 : IJKL + SPACE ----------------------
+        if k == pygame.K_SPACE:
+            self.p2_ready = not self.p2_ready    # SPACE locks / unlocks P2
+            if self.p2_ready:
+                self.flash = 8
+        elif not self.p2_ready:
+            if k == pygame.K_j:
+                self.p2_idx = self._move(self.p2_idx, -1, 0)
+            elif k == pygame.K_l:
+                self.p2_idx = self._move(self.p2_idx, +1, 0)
+            elif k == pygame.K_i:
+                self.p2_idx = self._move(self.p2_idx, 0, -1)
+            elif k == pygame.K_k:
+                self.p2_idx = self._move(self.p2_idx, 0, +1)
 
+    # ------------------------------------------------------------------
+    # per-frame update (auto-launch once both warriors are READY)
+    # ------------------------------------------------------------------
+    def update(self, dt):
+        self.t += 1
+        if self.flash > 0:
+            self.flash -= 1
+        if self.p1_ready and self.p2_ready and self.launch_timer is None:
+            self.launch_timer = 90               # ~1.5 s dramatic pause
+        if self.launch_timer is not None:
+            self.launch_timer -= 1
+            if self.launch_timer <= 0:
+                self.game.start_fight(ROSTER[self.p1_idx],
+                                      ROSTER[self.p2_idx])
+
+    # ------------------------------------------------------------------
+    # drawing — cards
+    # ------------------------------------------------------------------
+    def _draw_card(self, target, i, hero):
+        r = self.cell_rect(i)
+        hovered = i in (self.p1_idx, self.p2_idx)
+        col = hero["color"]
+        spc = hero["special_color"]
+
+        # ---- dark card body with saffron inner trim ----
+        pygame.draw.rect(target, (22, 12, 30), r, border_radius=10)
+        pygame.draw.rect(target, (60, 34, 12), r.inflate(-6, -6), 1,
+                         border_radius=8)
+        if hovered:                              # subtle lift highlight
+            pygame.draw.rect(target, (38, 22, 50), r.inflate(-4, -4),
+                             border_radius=9)
+
+        # ---- mini fighter preview (upper half of the card) ----
+        prev = pygame.Rect(r.x + 4, r.y + 26, 62, r.height - 66)
+        draw_mini_warrior(target, prev, hero, self.t + i * 13)
+
+        # ---- name in the character's own colour ----
+        nm = FONT_TINY.render(hero["name"], True, col)
+        target.blit(nm, (r.x + 6, r.y + 5))
+        pw = FONT_TINY.size(hero["weapon"])[0]
+        wtag = FONT_TINY.render(hero["weapon"], True, GREY)
+        target.blit(wtag, (r.right - pw - 6, r.y + 7))
+
+        # ---- stat bars: HP / SPD / PWR ----
+        bx = prev.right + 8
+        bw = r.right - bx - 10
+        stats = [("HP", hero["health"], 140, GREEN),
+                 ("SPD", hero["speed"], 8, (90, 160, 255)),
+                 ("PWR", hero["special_damage"], 30, SAFFRON)]
+        sy = r.y + 30
+        for label, val, vmax, bar_col in stats:
+            lb = FONT_TINY.render(label, True, WHITE)
+            target.blit(lb, (bx, sy - 3))
+            track = pygame.Rect(bx + 30, sy, bw - 30, 8)
+            pygame.draw.rect(target, (50, 30, 60), track, border_radius=4)
+            frac = max(0.06, min(1.0, val / vmax))
+            fill = track.copy()
+            fill.width = max(3, int(track.width * frac))
+            pygame.draw.rect(target, bar_col, fill, border_radius=4)
+            pygame.draw.rect(target, (90, 60, 30), track, 1,
+                             border_radius=4)
+            sy += 22
+
+        # ---- special move name in special_color ----
+        sn = f"★ {hero['special_name']}"
+        sw_ = FONT_TINY.size(sn)[0]
+        if sw_ > r.width - 12:                  # shrink-fit long names
+            sn = hero["special_name"][:14] + "…"
+        st = FONT_TINY.render(sn, True, spc)
+        target.blit(st, (r.centerx - st.get_width() // 2, r.bottom - 18))
+
+        # ---- glowing cursor borders (red = P1, blue = P2) ----
+        if i == self.p1_idx:
+            pulse = 150 + 105 * abs(math.sin(self.t * 0.08))
+            glow_surf = pygame.Surface((r.w + 16, r.h + 16), pygame.SRCALPHA)
+            pygame.draw.rect(glow_surf, (*DEEP_RED, int(pulse) // 3),
+                             (0, 0, r.w + 16, r.h + 16), 8, border_radius=14)
+            target.blit(glow_surf, (r.x - 8, r.y - 8))
+            pygame.draw.rect(target, (255, 70, 70), r, 3, border_radius=10)
+            tag = FONT_TINY.render("P1 ✓ READY" if self.p1_ready
+                                   else "P1", True,
+                                   (60, 220, 60) if self.p1_ready else WHITE)
+            target.blit(tag, (r.x + 4, r.y - 20))
+        if i == self.p2_idx:
+            pulse = 150 + 105 * abs(math.sin(self.t * 0.08 + 1.3))
+            glow_surf = pygame.Surface((r.w + 16, r.h + 16), pygame.SRCALPHA)
+            pygame.draw.rect(glow_surf, (*DARK_BLUE, int(pulse) // 2),
+                             (0, 0, r.w + 16, r.h + 16), 8, border_radius=14)
+            target.blit(glow_surf, (r.x - 8, r.y - 8))
+            inner = r.inflate(-10, -10)
+            pygame.draw.rect(target, (90, 150, 255), inner, 3,
+                             border_radius=8)
+            tag = FONT_TINY.render("P2 ✓ READY" if self.p2_ready
+                                   else "P2", True,
+                                   (60, 220, 60) if self.p2_ready else WHITE)
+            target.blit(tag, (r.right - tag.get_width() - 4, r.y - 20))
+
+    # ------------------------------------------------------------------
+    # drawing — bottom info panel (description + dialogue quote)
+    # ------------------------------------------------------------------
+    def _draw_panel(self, target):
+        p = pygame.Rect(24, self.PANEL_TOP, SCREEN_WIDTH - 48, 112)
+        pygame.draw.rect(target, (18, 10, 26), p, border_radius=12)
+        pygame.draw.rect(target, (120, 70, 20), p, 2, border_radius=12)
+        draw_dharma_chakra(target, p.x + 26, p.centery, 16, SAFFRON,
+                           spokes=12, angle_offset=self.t * 0.02)
+        draw_dharma_chakra(target, p.right - 26, p.centery, 16, SAFFRON,
+                           spokes=12, angle_offset=-self.t * 0.02)
+
+        # two focus heroes: whoever is hovering (P1 takes precedence
+        # visually, P2 shown mirrored on the right side)
+        left_hero = ROSTER[self.p1_idx]
+        right_hero = ROSTER[self.p2_idx]
+
+        def block(hero, x, w, align_right=False):
+            head = f"{hero['name']} — {hero['epithet']}"
+            h = FONT_SMALL.render(head, True, hero["color"])
+            desc = wrap_text(hero["description"], FONT_TINY, w - 20, 2)
+            quote_src = (hero["intro_dialogue"][0]
+                         if self.t // 45 % 2 == 0
+                         else hero["intro_dialogue"][1])
+            quote = wrap_text(f"“{quote_src}”", FONT_TINY, w - 20, 2)
+            tx = x + (w - h.get_width()) // 2 if not align_right else \
+                x + w - h.get_width()
+            target.blit(h, (tx, p.y + 8))
+            yy = p.y + 34
+            for line in desc:
+                img = FONT_TINY.render(line, True, GREY)
+                target.blit(img, (x + 10, yy))
+                yy += 17
+            yy += 2
+            for line in quote:
+                img = FONT_TINY.render(line, True, GOLD)
+                target.blit(img, (x + 10, yy))
+                yy += 17
+
+        half = (p.width - 90) // 2
+        block(left_hero, p.x + 46, half)
+        block(right_hero, p.x + 46 + half + 20, half)
+
+        # VS emblem between the two blocks
+        vs = FONT_MEDIUM.render("VS", True, DEEP_RED)
+        target.blit(vs, (p.centerx - vs.get_width() // 2, p.centery - 14))
+
+    # ------------------------------------------------------------------
+    # main draw
+    # ------------------------------------------------------------------
     def draw(self, target):
-        self.game.background.draw(target)
+        self.game.background.draw(target, dim=110)   # dimmed sunset arena
+
+        # ---- corner dharma chakras (decorative, slowly spinning) ----
+        spin = self.t * 0.015
+        draw_dharma_chakra(target, 26, 26, 20, SAFFRON, 16, spin)
+        draw_dharma_chakra(target, SCREEN_WIDTH - 26, 26, 20, SAFFRON,
+                           16, -spin)
+        draw_dharma_chakra(target, 26, SCREEN_HEIGHT - 26, 20, GOLD, 16,
+                           -spin)
+        draw_dharma_chakra(target, SCREEN_WIDTH - 26, SCREEN_HEIGHT - 26,
+                           20, GOLD, 16, spin)
+
+        # ---- gold title + control hints ----
         draw_centered_text(target, "CHOOSE YOUR WARRIOR", FONT_LARGE,
-                           GOLD, SCREEN_WIDTH // 2, 40, shadow=True)
+                           GOLD, SCREEN_WIDTH // 2, 26, shadow=True)
         draw_centered_text(target,
-                           "P1: A/D/W/S or ARROWS browse · ENTER lock    |    "
-                           "P2: I/J/K/L browse · B/N lock    |    "
-                           "both locked -> press ENTER to FIGHT",
-                           FONT_SMALL, WHITE, SCREEN_WIDTH // 2, 95)
+                           "P1: ARROW KEYS browse · ENTER confirm      "
+                           "P2: I J K L browse · SPACE confirm",
+                           FONT_SMALL, SAFFRON, SCREEN_WIDTH // 2, 100)
 
+        # ---- the 10 cards ----
         for i, hero in enumerate(ROSTER):
-            r = self.cell_rect(i)
-            pygame.draw.rect(target, (25, 15, 35), r, border_radius=12)
+            self._draw_card(target, i, hero)
 
-            border_color, width = None, 3
-            if i == self.p1_idx:
-                border_color, width = SAFFRON, 5
-            pygame.draw.rect(target, border_color or GREY, r, width,
-                             border_radius=12)
-            if i == self.p2_idx:
-                inner = r.inflate(-14, -14)
-                pygame.draw.rect(target, DARK_BLUE, inner, 5,
-                                 border_radius=10)
+        # ---- bottom info panel ----
+        self._draw_panel(target)
 
-            # mini portrait: coloured circle "warrior" bust
-            pcx, pcy = r.centerx, r.centery - 20
-            pygame.draw.circle(target, hero["secondary_color"],
-                               (pcx, pcy), 24)
-            pygame.draw.rect(target, hero["color"],
-                             (pcx - 19, pcy + 16, 38, 28), border_radius=6)
-            pygame.draw.polygon(target, GOLD, [(pcx - 13, pcy - 16),
-                                               (pcx, pcy - 34),
-                                               (pcx + 13, pcy - 16)])
+        # ---- status line under the grid ----
+        status = []
+        status.append(f"P1: {ROSTER[self.p1_idx]['name']}"
+                      + ("  ✓ READY" if self.p1_ready else ""))
+        status.append(f"P2: {ROSTER[self.p2_idx]['name']}"
+                      + ("  ✓ READY" if self.p2_ready else ""))
+        draw_centered_text(target, "      |      ".join(status),
+                           FONT_SMALL, WHITE, SCREEN_WIDTH // 2,
+                           self.GRID_Y + 2 * self.CARD_H + self.GAP_Y + 26)
 
-            name_c = WHITE if i != self.p1_idx else SAFFRON
-            draw_centered_text(target, hero["name"], FONT_SMALL, name_c,
-                               r.centerx, r.bottom - 36)
-            draw_centered_text(target, hero["epithet"], FONT_SMALL,
-                               GREY, r.centerx, r.bottom - 14)
+        # ---- launch sequence: "FIGHT!" teaser banner ----
+        if self.launch_timer is not None:
+            grow = 1.0 + 0.35 * math.sin(self.t * 0.35)
+            fs = pygame.font.SysFont("arial", max(20, int(56 * grow)),
+                                     bold=True)
+            draw_centered_text(target, "THE WAR BEGINS...", fs, SAFFRON,
+                               SCREEN_WIDTH // 2, 250, shadow=True)
+        elif blink_visible(pygame.time.get_ticks(), 900, 0.6):
+            draw_centered_text(target,
+                               "Both warriors must press their confirm key!",
+                               FONT_SMALL, GREEN, SCREEN_WIDTH // 2, 250)
 
-        # selection tags floating over chosen cards
-        for idx, ready, label in ((self.p1_idx, self.p1_ready, "P1"),
-                                  (self.p2_idx, self.p2_ready, "P2")):
-            r = self.cell_rect(idx)
-            tag = FONT_SMALL.render(
-                f"{label}: {'READY!' if ready else 'select'}", True,
-                SAFFRON if label == "P1" else WHITE)
-            target.blit(tag, (r.x + 4, r.y - 24))
-
-        self._draw_stats_panel(target)
-
-        if self.p1_ready and self.p2_ready:
-            if blink_visible(pygame.time.get_ticks()):
-                draw_centered_text(target,
-                                   "Press ENTER then G to Begin the War!",
-                                   FONT_MEDIUM, GREEN, SCREEN_WIDTH // 2,
-                                   470, shadow=True)
+        # ---- white lock-in flash ----
+        if self.flash > 0:
+            veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT),
+                                  pygame.SRCALPHA)
+            veil.fill((255, 255, 255, self.flash * 12))
+            target.blit(veil, (0, 0))
 
 
 class FightState(GameState):
@@ -2409,12 +2697,17 @@ class FightState(GameState):
         self._draw_hud(screen)
         self._draw_banner(screen)
 
-        # "FIGHT!" banner for first second
+        # "FIGHT!" announcement for the first 1.4 s of every bout
         elapsed = pygame.time.get_ticks() - self.round_start
-        if elapsed < 1000:
+        if elapsed < 1400:
+            grow = 1.0 + 0.25 * math.sin(elapsed * 0.02)
+            fsz = max(30, int(90 * grow))
             draw_centered_text(screen, "FIGHT!",
-                               pygame.font.SysFont("arial", 90, bold=True),
+                               pygame.font.SysFont("arial", fsz, bold=True),
                                GOLD, SCREEN_WIDTH // 2, 250, shadow=True)
+            intro = (self.f1.name + "  vs  " + self.f2.name)
+            draw_centered_text(screen, intro, FONT_MEDIUM, SAFFRON,
+                               SCREEN_WIDTH // 2, 320, shadow=True)
         elif self.winner:
             draw_centered_text(screen, f"{self.winner.name} WINS!",
                                FONT_LARGE, GOLD, SCREEN_WIDTH // 2, 250,
@@ -2690,7 +2983,7 @@ class ResultState(GameState):
                 self.game.change_state(STATE_CHARACTER_SELECT)
 
     def draw(self, target):
-        self.game.background.draw(target)
+        self.game.background.draw(target, dim=60)
         winner = getattr(self.game, "result_winner", "WARRIOR")
         win_line = getattr(self.game, "result_win_line", None)
         lose_line = getattr(self.game, "result_lose_line", None)
