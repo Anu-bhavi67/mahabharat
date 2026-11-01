@@ -4,17 +4,34 @@
   A 2D fighting game built with Python + Pygame
 =====================================================================
 
-  Controls
+  Controls  (FULL COMBAT SYSTEM)
   --------
-  MENU             : ENTER  -> start game
-  CHARACTER_SELECT : P1 uses A/D to browse, W to confirm
-                     P2 uses LEFT/RIGHT to browse, UP to confirm
-  FIGHT            : P1: A/D move, W jump, S block, C crouch, F punch,
-                          G kick, T special (when meter is full)
-                     P2: arrows move/jump/block, M crouch, K punch,
-                         L kick, ENTER special
-  RESULT           : ENTER  -> back to main menu
+  MENU             : ENTER / SPACE  -> start game
+  CHARACTER_SELECT : P1 browse with A/D/W/S or ARROWS, ENTER to lock
+                     P2 browse with I/J/K/L, B or N to lock
+                     once both are locked press ENTER to fight
+  FIGHT — PLAYER 1 : ←/→ move   ↑ jump   ↓ crouch
+                     ↓ + ← (back) BLOCK   Z punch (20f)  X kick (25f)
+                     CTRL special (needs a full meter)
+  FIGHT — PLAYER 2 : J/L move   I jump   K crouch
+                     K + J (back) BLOCK   B punch (20f)  N kick (25f)
+                     SPACE special (needs a full meter)
+  RESULT           : ENTER -> main menu   |   C -> character select
   Anywhere         : ESC    -> quit
+
+  Combat rules implemented in the Fighter class:
+    * Punch  : fast, low damage,  20-frame cooldown, reach 70 px
+    * Kick   : slower, more dmg,  25-frame cooldown, reach 95 px
+    * Active window: hitbox live during frames 12-20 of the move;
+      the fist/foot glows YELLOW while active and the limb extends.
+    * Blocking (hold down/back): -75% damage, shield arc drawn in front,
+      10 frames of block stun in which the blocker cannot act.
+    * Hit reaction: 15-frame WHITE FLASH, knockback away from the attacker
+      and brief hit stun that locks all actions.
+    * Combo system: consecutive hits inside 60 frames count up and show
+      "X HIT COMBO!" in gold; the counter resets when the window expires.
+    * Damage: health drops on hit (never below 0) and the attacker gains
+      special meter equal to 1.5x the damage dealt.
 
   All visuals are drawn procedurally (pygame.font + shapes).
   No external image/sound assets are required.
@@ -59,6 +76,7 @@ STATE_RESULT = "RESULT"
 
 # --- Fonts (created once, reused everywhere) --------------------------
 FONT_SMALL  = pygame.font.SysFont("arial", 22)
+FONT_COMBO  = pygame.font.SysFont("arial", 34, bold=True)   # "X HIT COMBO!"
 FONT_MEDIUM = pygame.font.SysFont("arial", 32, bold=True)
 FONT_LARGE  = pygame.font.SysFont("arial", 64, bold=True)
 FONT_TITLE  = pygame.font.SysFont("arial", 72, bold=True)
@@ -250,21 +268,50 @@ class Fighter:
         self.y = float(y)               # height above GROUND_Y
         self.vel_y = 0.0                # vertical velocity (jump physics)
         self.vx = 0.0                   # knockback slide velocity
+        self.vy = 0.0                   # knockback LIFT velocity (air pop)
         self.facing = 1 if facing >= 0 else -1
-        self.state = "idle"             # idle|walk|jump|crouch|punch|kick|
-                                        # block|hurt|special
-        self.state_timer = 0
-        self.attack_hit = False         # melee can only connect once
+        self.state = "idle"             # idle|walk|jump|crouch|block|
+                                        # punch|kick|hurt|ko
         self.anim_time = 0.0            # accumulates frames for animations
-        self.special_meter = 0.0        # 0..100, charged by dealing damage
+
+        # =============== FULL COMBAT SYSTEM STATE ====================
+        # Attacks run on a per-frame countdown so the active window is
+        # deterministic: PUNCH = 20 total frames, KICK = 25 total frames.
+        # The hitbox is live during FRAMES 12-20 of the move (i.e. while
+        # the countdown sits between 8 and 0).
+        self.punch_cooldown = 0         # frames until next punch allowed
+        self.kick_cooldown = 0          # frames until next kick allowed
+        self.attack_total = 0           # 20 or 25 — progress denominator
+        self.attack_hit = False         # one connect per swing
+        self.hit_flash = 0              # white-flash frames left (max 15)
+        self.block_stun = 0             # 10 frames frozen while guarding
+        self.combo_count = 0            # consecutive hits landed
+        self.combo_timer = 0            # combo window (60 frames)
+        self.special_meter = 0.0        # 0..100, +1.5x damage dealt
         self.projectiles = []           # this fighter's astral blasts
         self.ai_decision_timer = 0
+        self.is_channeling = False        # True while casting the astral weapon
+
+    # ------------------------------------------------------------------
+    # COMBAT TIMING CONSTANTS (per spec)
+    # ------------------------------------------------------------------
+    PUNCH_TOTAL = 20        # punch lasts 20 frames -> 20-frame cooldown
+    KICK_TOTAL = 25         # kick lasts 25 frames -> 25-frame cooldown
+    ACTIVE_FROM = 12        # hitbox live from frame 12 of the move ...
+    ACTIVE_TO = 20          # ... through frame 20 (punch); kick stays
+                            #     active to the end of its 25 frames
+    HIT_STUN = 14           # hit reaction locks actions briefly
+    HIT_FLASH_FRAMES = 15   # white flash duration when hit
+    BLOCK_REDUCTION = 0.75  # blocking absorbs 75% of incoming damage
+    BLOCK_STUN_FRAMES = 10  # blocker cannot act for 10 frames
+    COMBO_WINDOW = 60       # consecutive hits within 60 frames = combo
+    METER_GAIN = 1.5        # attacker gains 1.5x damage dealt as meter
 
     # ------------------------------------------------------------------
     # geometry & collision
     # ------------------------------------------------------------------
     def get_rect(self):
-        """Body hitbox.  Crouching halves the effective height so low
+        """Body hitbox.  Crouching shrinks the effective height so low
         attacks slip under high ones and vice-versa."""
         h = CROUCH_HEIGHT if self.state == "crouch" else STAND_HEIGHT
         foot_y = GROUND_Y - self.y
@@ -278,10 +325,24 @@ class Fighter:
     def rect(self):
         return self.get_rect()
 
+    def is_attack_active(self):
+        """True only inside the attack's ACTIVE WINDOW.
+
+        Frame numbering runs 1..TOTAL from the moment the move starts;
+        state_timer counts *down*, so elapsed_frame = total - timer.
+        Punch hitbox: frames 12-20.  Kick hitbox: frames 12-25
+        (same start, longer reach and a wider window)."""
+        if self.state not in ("punch", "kick"):
+            return False
+        elapsed = self.attack_total - self.state_timer   # 1 .. total
+        if self.state == "punch":
+            return self.ACTIVE_FROM <= elapsed <= self.ACTIVE_TO
+        return elapsed >= self.ACTIVE_FROM               # kick: 12 .. 25
+
     def get_attack_rect(self):
         """Invisible hurt-box that extends IN FRONT of the fighter while a
         melee attack is in its active window; empty rect otherwise."""
-        if self.state not in ("punch", "kick"):
+        if not self.is_attack_active():
             return pygame.Rect(0, 0, 0, 0)
         reach = self.attack_range()
         box_h = 34
@@ -331,28 +392,66 @@ class Fighter:
         elif not active and self.state == "crouch":
             self.state = "idle"
 
-    def block(self):
+    def try_block(self):
+        """Enter the guarding stance (grounded, neutral stances only)."""
+        if self.block_stun > 0:
+            return                       # still frozen from the last guard
         if self.y == 0 and self.state in ("idle", "walk", "crouch"):
             self.state = "block"
-            self.state_timer = 20
+
+    def release_block(self):
+        """Hold-to-block: the guard drops the instant the key is let go."""
+        if self.state == "block" and self.block_stun == 0:
+            self.state = "idle"
 
     def _busy(self):
-        return self.state in ("punch", "kick", "hurt", "special")
+        """States that lock out every other action (hit stun included)."""
+        return (self.state in ("punch", "kick", "hurt", "ko")
+                or self.block_stun > 0)
 
-    # ---------- combat ----------
+    # ---------- combat: attacks ----------
     def start_attack(self, kind):
-        """Begin a punch or kick (only from neutral stances)."""
-        if self.state in ("idle", "walk", "crouch"):
-            self.state = kind
-            self.state_timer = 18 if kind == "punch" else 26
-            self.attack_hit = False
+        """Begin a punch (20f cycle) or kick (25f cycle).
+
+        Rules enforced here:
+          * only from neutral stances (idle / walk / crouch / grounded)
+          * per-attack cooldown must have expired (20f / 25f)
+          * you cannot be in hit-stun, knockback lift or KO'd
+        """
+        if self.health <= 0 or self.state == "ko":
+            return
+        if self.block_stun > 0 or self.vy != 0.0:
+            return
+        if self.state not in ("idle", "walk", "crouch", "block", "jump"):
+            return
+        if kind == "punch":
+            if self.punch_cooldown > 0:
+                return
+            self.state = "punch"
+            self.attack_total = self.PUNCH_TOTAL
+            self.state_timer = self.PUNCH_TOTAL
+            self.punch_cooldown = self.PUNCH_TOTAL   # 20-frame cooldown
+        elif kind == "kick":
+            if self.kick_cooldown > 0:
+                return
+            self.state = "kick"
+            self.attack_total = self.KICK_TOTAL
+            self.state_timer = self.KICK_TOTAL
+            self.kick_cooldown = self.KICK_TOTAL     # 25-frame cooldown
+        else:
+            return
+        self.attack_hit = False                      # fresh swing can connect
 
     def start_special(self):
         """Unleash the character's signature astral weapon (needs full meter)."""
         if self.special_meter >= 100 and self.state in ("idle", "walk"):
             self.special_meter = 0.0
-            self.state = "special"
-            self.state_timer = 34
+            self.state = "punch"                 # channeling pose = thrust
+            self.attack_total = 20
+            self.state_timer = 20
+            self.punch_cooldown = max(self.punch_cooldown, 20)
+            self.attack_hit = True               # the melee box must NOT hit
+            self.is_channeling = True
             foot_y = GROUND_Y - self.y
             self.projectiles.append({
                 "x": self.x + self.facing * 45,
@@ -365,6 +464,7 @@ class Fighter:
         return False
 
     def current_damage(self):
+        """Damage table straight from the CHARACTERS database."""
         if self.state == "punch":
             return self.punch_damage
         if self.state == "kick":
@@ -375,13 +475,52 @@ class Fighter:
         """Melee reach depends on the strike — kicks travel further."""
         return 70 if self.state == "punch" else 95
 
-    def take_hit(self, dmg, from_facing):
-        """Receive damage: stagger state + knockback slide."""
-        self.health = max(0, self.health - dmg)
-        self.state = "hurt"
-        self.state_timer = 14
-        self.vx = from_facing * 6      # knockback
+    # ---------- combat: receiving damage ----------
+    def take_hit(self, dmg, attacker=None):
+        """Receive damage with the full hit-reaction pipeline:
+
+          * BLOCKING  -> damage x (1 - 0.75), 10-frame block stun,
+                         no combo credit for the attacker
+          * HIT       -> white flash 15 frames, hit stun, knockback
+                         AWAY from the attacker (slide + slight air pop)
+          * health never drops below 0; KO locks the fighter down
+        Returns the damage actually applied (used for sparks/meter)."""
+        if self.state == "ko":
+            return 0
+        facing_in = attacker.facing if attacker is not None else self._last_attacker_facing(attacker)
+        blocked = (self.state == "block") or \
+                  (self.state == "crouch" and attacker is not None and
+                   abs(self.x - attacker.x) < 140 and
+                   attacker.state == "kick")   # crouching ducks punches
+
+        if blocked:
+            applied = max(1, int(round(dmg * (1.0 - self.BLOCK_REDUCTION))))
+            self.health = max(0, self.health - applied)
+            self.block_stun = self.BLOCK_STUN_FRAMES      # 10 frozen frames
+            self.vx = facing_in * 3                        # small push-back
+            return applied
+
+        applied = int(dmg)
+        self.health = max(0, self.health - applied)
+        self.hit_flash = self.HIT_FLASH_FRAMES             # flash white 15f
+        self.combo_count = 0                               # your own combo dies
+        self.combo_timer = 0
+        if self.health <= 0:
+            self.state = "ko"
+            self.state_timer = 0
+            self.vx = facing_in * 7
+            self.vy = 4                                    # dramatic pop-up
+        else:
+            self.state = "hurt"                            # hit stun
+            self.state_timer = self.HIT_STUN
+            self.vx = facing_in * 6                        # knockback slide
+            self.vy = 2                                    # slight lift
         self._clamp_to_stage()
+        return applied
+
+    @staticmethod
+    def _last_attacker_facing(attacker):
+        return 1 if attacker is None else attacker.facing
 
     # ------------------------------------------------------------------
     # per-frame physics / animation update
@@ -392,16 +531,24 @@ class Fighter:
                      min(SCREEN_WIDTH - BODY_LEFT_MARGIN, self.x))
 
     def apply_gravity(self):
-        """Vertical velocity + ground detection at y = GROUND_Y (offset 0)."""
-        if self.y > 0 or self.vel_y != 0:
+        """Vertical velocity + ground detection at y = GROUND_Y (offset 0).
+
+        Two vertical channels are used:
+          vel_y -> the fighter's own jump arc
+          vy    -> knockback LIFT pushed by an opponent's strike
+        Both feed the same position and stop dead on the ground line."""
+        airborne = self.y > 0 or self.vel_y != 0 or self.vy != 0
+        if airborne:
             self.vel_y -= GRAVITY
-            self.y += self.vel_y
-            if self.y <= 0:                    # touched down on the ground
-                self.y, self.vel_y = 0.0, 0.0
+            self.vy -= GRAVITY * 0.6          # knockback lift falls sooner
+            self.y += self.vel_y + self.vy
+            if self.y <= 0:                   # touched down on the ground
+                self.y, self.vel_y, self.vy = 0.0, 0.0, 0.0
                 if self.state == "jump":
                     self.state = "idle"
 
     def update(self, opponent):
+        """One simulation step for this fighter (called once per frame)."""
         # --- jump / gravity physics ---
         self.apply_gravity()
 
@@ -413,17 +560,40 @@ class Fighter:
         self._clamp_to_stage()
 
         # --- facing auto-updates to look at the opponent ---
-        # (locked while committed to an attack or recoiling)
+        # (locked while committed to an attack, recoiling or KO'd)
         if opponent is not None and \
-                self.state not in ("punch", "kick", "special", "hurt"):
+                self.state not in ("punch", "kick", "hurt", "ko"):
             self.facing = 1 if opponent.x > self.x else -1
 
-        # --- action timers ---
+        # --- attack / stun countdowns (per-frame, 60 FPS) ---
         if self.state_timer > 0:
             self.state_timer -= 1
-            if self.state_timer == 0 and self.state in (
-                    "punch", "kick", "hurt", "block", "special"):
-                self.state = "idle"
+            if self.state_timer == 0:
+                if self.state in ("punch", "kick"):
+                    self.is_channeling = False
+                    self.state = "idle"
+                elif self.state == "hurt":
+                    self.state = "idle"       # hit stun over -> actionable
+
+        # --- action cooldowns tick down every frame ---
+        if self.punch_cooldown > 0:
+            self.punch_cooldown -= 1
+        if self.kick_cooldown > 0:
+            self.kick_cooldown -= 1
+
+        # --- block stun: frozen but still guarding ---
+        if self.block_stun > 0:
+            self.block_stun -= 1
+
+        # --- white hit-flash timer ---
+        if self.hit_flash > 0:
+            self.hit_flash -= 1
+
+        # --- COMBO SYSTEM: window decays; reset after 60 idle frames ---
+        if self.combo_timer > 0:
+            self.combo_timer -= 1
+            if self.combo_timer == 0:
+                self.combo_count = 0
 
         # --- advance the animation clock (bobbing / leg cycle) ---
         self.anim_time += 1.0
@@ -432,9 +602,30 @@ class Fighter:
         if self.controls is None and opponent is not None:
             self.update_ai(opponent)
 
+    # ---------- combo bookkeeping (used by the fight scene) ----------
+    def register_hit(self, blocked=False):
+        """Credit one landed hit toward this attacker's combo counter.
+
+        Blocked hits do NOT extend a combo (they reset it), matching the
+        'consecutive hits' rule.  The window refreshes to 60 frames on
+        every clean hit."""
+        if blocked:
+            self.combo_count = 0
+            self.combo_timer = 0
+            return self.combo_count
+        self.combo_count += 1
+        self.combo_timer = self.COMBO_WINDOW      # 60-frame combo window
+        return self.combo_count
+
+    def add_meter(self, dmg):
+        """Damage system: attacker charges the astral meter at 1.5x the
+        damage actually dealt (capped at 100)."""
+        self.special_meter = min(100.0,
+                                 self.special_meter + dmg * self.METER_GAIN)
+
     def update_ai(self, opponent):
         """Very simple aggressive AI so a solo player can fight someone."""
-        if self.state in ("punch", "kick", "hurt", "special"):
+        if self._busy():
             return
         self.ai_decision_timer -= 1
         if self.ai_decision_timer > 0:
@@ -453,7 +644,7 @@ class Fighter:
             self.x -= self.facing * max(2, self.speed)   # back off sometimes
         elif opponent.state in ("punch", "kick") and roll < 0.45:
             self.state = "block"               # try to guard
-            self.state_timer = 15
+            self.block_stun = 15               # hold the guard a moment
         elif roll < 0.75:
             self.start_attack(random.choice(["punch", "kick"]))
         elif roll < 0.85 and self.y == 0:
@@ -564,9 +755,12 @@ class Fighter:
         self._draw_aura(target, cx, foot_y)
 
         # ---- legs (lines) + feet (small rects) ----
+        # KICK VISUAL: the front leg extends outward.  Progress runs 0->1
+        # across the 25-frame cycle; the leg snaps out fast and retracts.
         kick_ext = 0
         if self.state == "kick":
-            kick_ext = int(math.sin(self.state_timer / 26 * math.pi) * 55)
+            progress = 1.0 - self.state_timer / max(1, self.attack_total)
+            kick_ext = int(math.sin(min(1.0, progress * 1.15) * math.pi) * 62)
         if self.state != "kick":
             # left leg
             lx = cx - 14 + sway
@@ -588,7 +782,10 @@ class Fighter:
             kx = cx + f * (25 + kick_ext)
             ky = foot_y - int(55 * squash)
             pygame.draw.line(target, skin, (cx, hip_y), (kx, ky), leg_w)
-            pygame.draw.rect(target, GOLD, (kx - 6, ky - 4, 14, 7),
+            # FOOT VISUAL: glows yellow while the kick hitbox is active
+            foot_glow = self.is_attack_active()
+            fc = GOLD if foot_glow else self.secondary_color
+            pygame.draw.rect(target, fc, (kx - 6, ky - 4, 14, 7),
                              border_radius=2)
 
         # ---- torso (rectangle = battle tunic) ----
@@ -614,8 +811,20 @@ class Fighter:
         # ---- arms (lines) + fists (circles), pose per state ----
         shoulder_l = (cx - 15, chest_y)
         shoulder_r = (cx + 15, chest_y)
-        if self.state == "special":
-            # both arms thrust forward channeling the astral weapon
+
+        # During an attack's ACTIVE WINDOW the fist / foot glows yellow.
+        active_now = self.is_attack_active()
+        fist_col = GOLD if active_now else skin
+        foot_col = GOLD if active_now else self.secondary_color
+
+        def glow_dot(px, py, radius=8):
+            """Small yellow energy halo around a striking limb."""
+            g = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+            pygame.draw.circle(g, (*GOLD, 190), (radius, radius), radius)
+            target.blit(g, (px - radius, py - radius))
+
+        if self.is_channeling:
+            # SPECIAL: both arms thrust forward channeling the astral weapon
             glow = int(20 + 12 * math.sin(self.state_timer * 0.5))
             end = (cx + f * 55, chest_y + 6)
             pygame.draw.line(target, skin, shoulder_l, end, arm_w)
@@ -626,10 +835,15 @@ class Fighter:
                                (glow, glow), glow)
             target.blit(aura, (end[0] - glow, end[1] - glow))
         elif self.state == "punch":
-            ext = int(self.state_timer / 18 * 45)
-            end = (cx + f * (30 + 45 - ext), chest_y + 6)
-            pygame.draw.line(target, skin, (cx, chest_y), end, arm_w)
-            pygame.draw.circle(target, GOLD, end, 7)      # fist
+            # PUNCH VISUAL: arm extends forward over the 20-frame cycle.
+            progress = 1.0 - self.state_timer / max(1, self.attack_total)
+            ext = int(math.sin(min(1.0, progress * 1.1) * math.pi) * 48)
+            end = (cx + f * (28 + ext), chest_y + 6)
+            front_shoulder = shoulder_r if f > 0 else shoulder_l
+            pygame.draw.line(target, skin, front_shoulder, end, arm_w)
+            pygame.draw.circle(target, fist_col, end, 7)   # fist
+            if active_now:
+                glow_dot(end[0], end[1])                   # glowing knuckles
             back = shoulder_l if f > 0 else shoulder_r
             pygame.draw.line(target, skin, back,
                              (cx - f * 12, chest_y + 22), arm_w)
@@ -641,15 +855,24 @@ class Fighter:
             pygame.draw.line(target, skin, shoulder_l if f > 0 else
                              shoulder_r, (cx + f * 10, chest_y + 24), arm_w)
         elif self.state == "block":
+            # Guard arms raised + a shield ARC drawn in front of the body
             pygame.draw.line(target, skin, shoulder_l,
                              (cx + f * 8, neck_y - 6), arm_w)
             pygame.draw.line(target, skin, shoulder_r,
                              (cx + f * 10, chest_y), arm_w)
-            shield = pygame.Surface((44, 90), pygame.SRCALPHA)
-            pygame.draw.rect(shield, (*GOLD, 120), (0, 0, 44, 90),
-                             border_radius=10)
-            target.blit(shield, (cx + f * 14 - (0 if f > 0 else 44),
-                                 neck_y - 14))
+            shield = pygame.Surface((56, 130), pygame.SRCALPHA)
+            arc_cx = 28 if f > 0 else 28
+            pygame.draw.arc(shield, (*GOLD, 230),
+                            (arc_cx - 26, 6, 52, 118),
+                            -1.15 if f > 0 else math.pi - 1.15,
+                            1.15 if f > 0 else math.pi + 1.15, 4)
+            inner = (*SAFFRON, 90) if self.block_stun == 0 else (*WHITE, 150)
+            pygame.draw.arc(shield, inner,
+                            (arc_cx - 18, 16, 36, 98),
+                            -1.15 if f > 0 else math.pi - 1.15,
+                            1.15 if f > 0 else math.pi + 1.15, 3)
+            target.blit(shield, (cx + f * 16 - (0 if f > 0 else 56),
+                                 neck_y - 20))
         elif self.state == "crouch":
             # arms tucked low, guarding stance
             pygame.draw.line(target, skin, shoulder_l,
@@ -666,12 +889,19 @@ class Fighter:
             pygame.draw.circle(target, GOLD, el, 5)       # fists
             pygame.draw.circle(target, GOLD, er, 5)
 
-        # ---- hurt flash ----
-        if self.state == "hurt":
-            flash = pygame.Surface((60, 160), pygame.SRCALPHA)
-            pygame.draw.rect(flash, (255, 60, 60, 90), (0, 0, 60, 160),
-                             border_radius=10)
-            target.blit(flash, (cx - 30, foot_y - 160))
+        # ---- WHITE HIT FLASH (15 frames after taking a clean hit) ----
+        if self.hit_flash > 0:
+            alpha = int(150 * (self.hit_flash / self.HIT_FLASH_FRAMES))
+            flash = pygame.Surface((64, STAND_HEIGHT + 12), pygame.SRCALPHA)
+            pygame.draw.rect(flash, (255, 255, 255, alpha), flash.get_rect(),
+                             border_radius=12)
+            target.blit(flash, (cx - 32, foot_y - STAND_HEIGHT - 6))
+
+        # ---- KO: slumped silhouette on the battlefield ----
+        if self.state == "ko":
+            pygame.draw.line(target, skin, (cx - f * 30, GROUND_Y - 10),
+                             (cx + f * 30, GROUND_Y - 6), 8)
+            pygame.draw.circle(target, skin, (cx + f * 38, GROUND_Y - 10), 12)
 
         # ---- name tag (P1/P2 prefix so sides are obvious) ----
         label = ("P2 · " if self.is_player2 else "P1 · ") + self.name
@@ -976,15 +1206,27 @@ def get_character(name):
     return CHARACTERS.get(name, ROSTER[0])
 
 
-P1_KEYS = {pygame.K_a: "left", pygame.K_d: "right", pygame.K_w: "jump",
-           pygame.K_s: "block", pygame.K_c: "crouch",
-           pygame.K_f: "punch", pygame.K_g: "kick",
-           pygame.K_t: "special"}
-P2_KEYS = {pygame.K_LEFT: "left", pygame.K_RIGHT: "right",
-           pygame.K_UP: "jump", pygame.K_DOWN: "block",
-           pygame.K_m: "crouch",
-           pygame.K_k: "punch", pygame.K_l: "kick",
-           pygame.K_RETURN: "special"}
+# ---------------------------------------------------------------------
+# PLAYER CONTROL MAPS  (spec: P1 = Arrow keys + Z/X,  P2 = IJKL + B/N)
+#   "back" = the direction AWAY from the opponent; holding back + down
+#   activates BLOCKING (classic fighting-game guard).
+# ---------------------------------------------------------------------
+P1_KEYS = {
+    pygame.K_LEFT:   "left",       # arrow keys
+    pygame.K_RIGHT:  "right",
+    pygame.K_UP:     "jump",
+    pygame.K_DOWN:   "back_down",  # crouch in place / block when held w/ back
+    pygame.K_z:      "punch",      # fast, low damage  (20-frame cooldown)
+    pygame.K_x:      "kick",       # medium, more dmg + longer range (25f)
+}
+P2_KEYS = {
+    pygame.K_i:      "up",         # I J K L layout: I=jump
+    pygame.K_j:      "left",
+    pygame.K_k:      "down",       # crouch / block-with-back
+    pygame.K_l:      "right",
+    pygame.K_b:      "punch",      # B = punch
+    pygame.K_n:      "kick",       # N = kick
+}
 
 
 
@@ -1033,7 +1275,8 @@ class MenuState(GameState):
         self.enter_time = pygame.time.get_ticks()
 
     def handle_event(self, event):
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
+        if event.type == pygame.KEYDOWN and \
+                event.key in (pygame.K_RETURN, pygame.K_SPACE):
             self.game.change_state(STATE_CHARACTER_SELECT)
 
     def draw(self, target):
@@ -1065,6 +1308,13 @@ class MenuState(GameState):
                                FONT_MEDIUM, SAFFRON, SCREEN_WIDTH // 2,
                                430, shadow=True)
 
+        draw_centered_text(
+            target,
+            "P1: ARROWS + Z punch / X kick      P2: IJKL + B punch / N kick",
+            FONT_SMALL, SAFFRON, SCREEN_WIDTH // 2, 495)
+        draw_centered_text(target,
+                           "Hold DOWN + BACK to BLOCK  ·  meter full = special",
+                           FONT_SMALL, GREY, SCREEN_WIDTH // 2, 525)
         draw_centered_text(target, "ESC to Quit", FONT_SMALL, GREY,
                            SCREEN_WIDTH // 2, 560)
 
@@ -1092,30 +1342,32 @@ class CharacterSelectState(GameState):
         if event.type != pygame.KEYDOWN:
             return
         k = event.key
+        # ---- PLAYER 1 : A/D/W/S or the ARROW keys, ENTER to confirm ----
         if not self.p1_ready:
-            if k == pygame.K_a:
+            if k in (pygame.K_a, pygame.K_LEFT):
                 self.p1_idx = (self.p1_idx - 1) % len(ROSTER)
-            elif k == pygame.K_d:
+            elif k in (pygame.K_d, pygame.K_RIGHT):
                 self.p1_idx = (self.p1_idx + 1) % len(ROSTER)
-            elif k == pygame.K_w:
+            elif k in (pygame.K_w, pygame.K_UP):
                 self.p1_idx = (self.p1_idx - 5) % len(ROSTER)
-            elif k == pygame.K_s:
+            elif k in (pygame.K_s, pygame.K_DOWN):
                 self.p1_idx = (self.p1_idx + 5) % len(ROSTER)
-            elif k in (pygame.K_RETURN, pygame.K_SPACE):
+            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 self.p1_ready = True
+        # ---- PLAYER 2 : I/J/K/L, B or N to confirm ----
         if not self.p2_ready:
-            if k == pygame.K_LEFT:
+            if k == pygame.K_j:
                 self.p2_idx = (self.p2_idx - 1) % len(ROSTER)
-            elif k == pygame.K_RIGHT:
+            elif k == pygame.K_l:
                 self.p2_idx = (self.p2_idx + 1) % len(ROSTER)
-            elif k == pygame.K_UP:
+            elif k == pygame.K_i:
                 self.p2_idx = (self.p2_idx - 5) % len(ROSTER)
-            elif k == pygame.K_DOWN:
+            elif k == pygame.K_k:
                 self.p2_idx = (self.p2_idx + 5) % len(ROSTER)
-            elif k in (pygame.K_RETURN, pygame.K_SPACE):
+            elif k in (pygame.K_b, pygame.K_n, pygame.K_SPACE):
                 self.p2_ready = True
         if self.p1_ready and self.p2_ready:
-            if k == pygame.K_KP_ENTER or k == pygame.K_g:
+            if k == pygame.K_RETURN or k == pygame.K_KP_ENTER:
                 self.game.start_fight(ROSTER[self.p1_idx],
                                       ROSTER[self.p2_idx])
         if k == pygame.K_ESCAPE:
@@ -1159,9 +1411,9 @@ class CharacterSelectState(GameState):
         draw_centered_text(target, "CHOOSE YOUR WARRIOR", FONT_LARGE,
                            GOLD, SCREEN_WIDTH // 2, 40, shadow=True)
         draw_centered_text(target,
-                           "P1: A/D/W/S move, ENTER confirm    |    "
-                           "P2: ARROWS move, SPACE confirm    |    "
-                           "ENTER+G when both ready",
+                           "P1: A/D/W/S or ARROWS browse · ENTER lock    |    "
+                           "P2: I/J/K/L browse · B/N lock    |    "
+                           "both locked -> press ENTER to FIGHT",
                            FONT_SMALL, WHITE, SCREEN_WIDTH // 2, 95)
 
         for i, hero in enumerate(ROSTER):
@@ -1238,6 +1490,10 @@ class FightState(GameState):
         self.hit_sparks = []          # (x, y, frames_left, color)
         self.banner = None            # (text, colour, expires_ms)
         self.taunt_at = pygame.time.get_ticks() + random.randint(6000, 9000)
+        # ---- COMBO SYSTEM pop-ups: (fighter, text, frames_left) ----
+        self.combo_pops = []
+        # frame counter that drives every cooldown / active-window check
+        self.fight_frame = 0
         # dramatic pre-fight exchange (2 intro lines from the database)
         intro = (p1_data["intro_dialogue"][0] + "   ||   " +
                  p2_data["intro_dialogue"][0])
@@ -1247,98 +1503,174 @@ class FightState(GameState):
     def set_banner(self, text, color=WHITE, ms=2800):
         self.banner = (text, color, pygame.time.get_ticks() + ms)
 
+    def _special_attempt(self, f):
+        """Try to fire the astral weapon; on success shout the dialogue."""
+        if f.start_special():
+            self.set_banner(f.data["special_dialogue"] + "  ·  "
+                            + f.special_name, f.special_color, 2600)
+
     def handle_event(self, event):
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_ESCAPE:
-                self.game.change_state(STATE_MENU)
-                return
-            if self.winner:
-                return
-            # map raw keydown to action for each fighter
-            for f in (self.f1, self.f2):
-                if f.controls is None:
-                    continue
-                for key, action in f.controls.items():
-                    if event.key == key:
-                        if action == "jump":
-                            f.jump()
-                        elif action == "punch":
-                            f.start_attack("punch")
-                        elif action == "kick":
-                            f.start_attack("kick")
-                        elif action == "block":
-                            f.block()
-                        elif action == "crouch":
-                            f.crouch(True)
-                        elif action == "special":
-                            if f.start_special():
-                                self.set_banner(f.data["special_dialogue"],
-                                                f.special_color, 2600)
+        """KEYDOWN-driven actions: attacks, jump and the special.
+
+        Movement / crouch / block are HOLD-based and handled per-frame in
+        _process_movement(); attacks are edge-triggered so holding a key
+        does not machine-gun (the 20/25-frame cooldowns also apply)."""
+        if event.type != pygame.KEYDOWN:
+            return
+        if event.key == pygame.K_ESCAPE:
+            self.game.change_state(STATE_MENU)
+            return
+        if self.winner:
+            return
+        k = event.key
+        # ---------------- PLAYER 1 : Arrow keys + Z (punch) X (kick) ------
+        if k == pygame.K_UP:
+            self.f1.jump()
+        elif k == pygame.K_z:
+            self.f1.start_attack("punch")
+        elif k == pygame.K_x:
+            self.f1.start_attack("kick")
+        elif k == pygame.K_LCTRL or k == pygame.K_RCTRL:
+            self._special_attempt(self.f1)      # P1 astral weapon
+        # ---------------- PLAYER 2 : IJKL + B (punch) N (kick) -----------
+        elif k == pygame.K_i:
+            self.f2.jump()
+        elif k == pygame.K_b:
+            self.f2.start_attack("punch")
+        elif k == pygame.K_n:
+            self.f2.start_attack("kick")
+        elif k == pygame.K_SPACE:
+            self._special_attempt(self.f2)      # P2 astral weapon
+
+    @staticmethod
+    def _back_key_action(held_back, down_held):
+        return "block" if (held_back and down_held) else "crouch"
 
     def _process_movement(self):
-        """Continuous movement while keys held down — at each warrior's speed."""
+        """HOLD-based controls, evaluated fresh every frame.
+
+        P1: LEFT/RIGHT walk, UP jump (edge), DOWN crouch,
+            DOWN + *back* direction  ->  BLOCK (guard)
+        P2: J/L walk, I jump (edge), K crouch,
+            K + *back* direction      ->  BLOCK (guard)
+
+        "Back" simply means the arrow pointing away from the opponent,
+        which is the classic fighting-game guard input."""
         pressed = pygame.key.get_pressed()
-        for f in (self.f1, self.f2):
-            if f.controls is None or self.winner:
-                continue
-            moving = False
-            crouching = False
-            for key, action in f.controls.items():
-                if pressed[key]:
-                    if action == "left":
-                        f.move_left()
-                        moving = True
-                    elif action == "right":
-                        f.move_right()
-                        moving = True
-                    elif action == "crouch":
-                        crouching = True
-            if crouching:
+        if self.winner:
+            return
+
+        # ---------------- PLAYER 1 (arrows + Z/X) ----------------
+        f = self.f1
+        left_held = bool(pressed[pygame.K_LEFT])
+        right_held = bool(pressed[pygame.K_RIGHT])
+        down_held = bool(pressed[pygame.K_DOWN])
+        back_held = (left_held if f.facing > 0 else right_held)
+        blocking = down_held and back_held
+        if blocking:
+            f.try_block()                      # shield arc appears
+        else:
+            f.release_block()                  # hold-to-block only
+            moved = False
+            if left_held:
+                f.move_left()
+                moved = True
+            if right_held:
+                f.move_right()
+                moved = True
+            if down_held and f.state in ("idle", "walk", "crouch"):
                 f.crouch(True)
-            elif f.state == "crouch":          # release the crouch key
+            elif f.state == "crouch":
                 f.crouch(False)
-            if not moving and f.state == "walk":
+            if not moved and f.state == "walk":
+                f.stop_walking()
+
+        # ---------------- PLAYER 2 (IJKL + B/N) ------------------
+        f = self.f2
+        left_held = bool(pressed[pygame.K_j])
+        right_held = bool(pressed[pygame.K_l])
+        down_held = bool(pressed[pygame.K_k])
+        back_held = (left_held if f.facing > 0 else right_held)
+        blocking = down_held and back_held
+        if blocking:
+            f.try_block()
+        else:
+            f.release_block()
+            moved = False
+            if left_held:
+                f.move_left()
+                moved = True
+            if right_held:
+                f.move_right()
+                moved = True
+            if down_held and f.state in ("idle", "walk", "crouch"):
+                f.crouch(True)
+            elif f.state == "crouch":
+                f.crouch(False)
+            if not moved and f.state == "walk":
                 f.stop_walking()
 
     def _resolve_hits(self):
-        """Check active melee attacks against the opponent's hitbox.
-        Uses the Fighter.get_attack_rect() front-box vs get_rect() body-box,
-        so crouching genuinely ducks under high punches."""
+        """FULL COMBAT RESOLUTION — melee attacks vs body hitboxes.
+
+        Pipeline per swing:
+          1. attacker must be inside the ACTIVE WINDOW (frames 12-20 of a
+             punch / frames 12-25 of a kick) and this swing must not have
+             connected yet (one hit per attack)
+          2. get_attack_rect() (extends in front) vs defender.get_rect()
+             (shrinks when crouching, so you can duck high punches)
+          3. damage comes from the character database (punch/kick damage)
+          4. defender.take_hit() applies BLOCK reduction (-75% + block
+             stun) or the HIT reaction (white flash, hit stun, knockback)
+          5. attacker charges the special meter (+1.5x damage dealt) and
+             the COMBO counter is refreshed inside its 60-frame window
+        """
         for attacker, defender in ((self.f1, self.f2), (self.f2, self.f1)):
-            if attacker.state not in ("punch", "kick") or attacker.attack_hit:
+            if attacker.is_channeling:          # astral cast, not a jab
                 continue
-            total = 18 if attacker.state == "punch" else 26
-            progress = 1 - attacker.state_timer / total
-            if not (0.3 < progress < 0.75):     # only the active window hits
+            if not attacker.is_attack_active() or attacker.attack_hit:
                 continue
             atk_box = attacker.get_attack_rect()
+            if atk_box.width <= 0:
+                continue
             if not atk_box.colliderect(defender.get_rect()):
                 continue
+
             attacker.attack_hit = True
-            dmg = attacker.current_damage()
-            if defender.state in ("block", "crouch"):
-                dmg = max(1, dmg // 4)          # guard/crouch absorbs most
-                spark_col = GOLD
-            else:
-                spark_col = DEEP_RED
-            defender.take_hit(dmg, attacker.facing)
-            attacker.special_meter = min(100, attacker.special_meter +
-                                         dmg * 1.6)
-            self.hit_sparks.append((attacker.x + attacker.facing *
-                                    attacker.attack_range() * 0.7,
-                                    GROUND_Y - defender.y - 110,
-                                    12, spark_col))
+            raw_dmg = attacker.current_damage()
+            was_blocking = defender.state == "block"
+            applied = defender.take_hit(raw_dmg, attacker)
+
+            # ---- DAMAGE SYSTEM: meter gain = 1.5x damage actually dealt --
+            attacker.add_meter(applied)
+
+            # ---- COMBO SYSTEM: consecutive hits within 60 frames ---------
+            combo = attacker.register_hit(blocked=was_blocking)
+            if combo >= 2:
+                self.combo_pops.append(
+                    (attacker, f"{combo} HIT COMBO!", 70))
+
+            spark_col = GOLD if was_blocking else DEEP_RED
+            self.hit_sparks.append((
+                defender.x, GROUND_Y - defender.y - 110,
+                12 if not was_blocking else 9, spark_col))
+            if was_blocking:
+                self.set_banner(f"{defender.name} BLOCKS!", GREY, 900)
 
     def _resolve_projectiles(self):
-        """Astral weapon blasts fly across the field until they connect."""
+        """Astral weapon blasts (specials) fly across the field until they
+        connect; they use special_damage and charge meter like any hit."""
         for f in (self.f1, self.f2):
             foe = self.f2 if f is self.f1 else self.f1
             for pr in list(f.projectiles):
                 pr["x"] += pr["vx"]
                 rect = pygame.Rect(int(pr["x"]) - 20, int(pr["y"]) - 20,
                                    40, 40)
-                if rect.colliderect(foe.get_hitbox()):
-                    foe.take_hit(f.special_damage, f.facing)
+                if rect.colliderect(foe.get_rect()):
+                    was_blocking = foe.state == "block"
+                    applied = foe.take_hit(f.special_damage, f)
+                    f.add_meter(applied)
+                    f.register_hit(blocked=was_blocking)
                     self.hit_sparks.append((pr["x"], pr["y"], 16,
                                             f.special_color))
                     f.projectiles.remove(pr)
@@ -1347,6 +1679,7 @@ class FightState(GameState):
 
     def update(self, dt):
         now = pygame.time.get_ticks()
+        self.fight_frame += 1          # master frame clock (60 FPS)
         if not self.winner:
             self._process_movement()
             self.f1.update(self.f2)
@@ -1369,6 +1702,9 @@ class FightState(GameState):
             self.banner = None
         self.hit_sparks = [(x, y, t - 1, c) for x, y, t, c in
                            self.hit_sparks if t > 1]
+        # combo pop-ups fade out on their own frame budget
+        self.combo_pops = [(f, txt, t - 1) for f, txt, t in self.combo_pops
+                           if t > 1]
         if self.winner and now >= self.end_delay_until:
             self.game.result_winner = self.winner.name
             self.game.change_state(STATE_RESULT)
@@ -1398,6 +1734,7 @@ class FightState(GameState):
             pygame.draw.circle(spark, (*GOLD, 255), (rad, rad), rad // 2)
             target.blit(spark, (x - rad, y - rad))
 
+        self._draw_combo_pops(target)
         self._draw_hud(target)
         self._draw_banner(target)
 
@@ -1411,6 +1748,31 @@ class FightState(GameState):
             draw_centered_text(target, f"{self.winner.name} WINS!",
                                FONT_LARGE, GOLD, SCREEN_WIDTH // 2, 250,
                                shadow=True)
+
+    def _draw_combo_pops(self, target):
+        """COMBO SYSTEM display — 'X HIT COMBO!' in gold above the fighter
+        who strung the hits together.  Only shown when combo >= 2 and it
+        pops/fades over its remaining frame budget."""
+        for f, txt, frames_left in self.combo_pops:
+            if f.combo_count < 2:
+                continue                      # window already expired
+            alpha = max(60, min(255, int(255 * frames_left / 70.0)))
+            scale = 1.0 + 0.25 * (frames_left / 70.0)   # slight pop-in
+            img = FONT_COMBO.render(txt, True, GOLD)
+            if scale != 1.0:
+                w = max(1, int(img.get_width() * scale))
+                h = max(1, int(img.get_height() * scale))
+                img = pygame.transform.smoothscale(img, (w, h))
+            sh = img.copy()
+            sh.set_alpha(alpha)
+            x = int(max(10, min(SCREEN_WIDTH - img.get_width() - 10,
+                                f.x - img.get_width() // 2)))
+            y = int(GROUND_Y - f.y - STAND_HEIGHT - 78)
+            outline = img.copy()
+            outline.set_alpha(min(alpha, 140))
+            target.blit(outline, (x + 2, y + 2))
+            img.set_alpha(alpha)
+            target.blit(img, (x, y))
 
     def _draw_banner(self, target):
         """Dialogue ribbon near the bottom — intros / specials / taunts."""
@@ -1483,10 +1845,11 @@ class FightState(GameState):
         draw_centered_text(target, "VS", FONT_MEDIUM, GOLD,
                            SCREEN_WIDTH // 2, 42, shadow=True)
         # control reminder
-        draw_centered_text(target,
-                           "P1: A/D move  W jump  S block  C crouch  F/G hit  T special   |   "
-                           "P2: ARROWS  DOWN block  M crouch  K/L hit  ENTER special",
-                           FONT_SMALL, GREY, SCREEN_WIDTH // 2, 580)
+        draw_centered_text(
+            target,
+            "P1: ←/→ move  ↑ jump  ↓+← crouch/block  Z punch  X kick  CTRL special"
+            "   ·   P2: J/L move  I jump  K+J crouch/block  B punch  N kick  SPACE special",
+            FONT_SMALL, GREY, SCREEN_WIDTH // 2, 580)
 
 
 class ResultState(GameState):
